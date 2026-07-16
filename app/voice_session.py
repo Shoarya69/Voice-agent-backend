@@ -26,6 +26,7 @@ from app.audio_utils import (
 from app.elevenlabs_service import ElevenLabsError, STTResult, elevenlabs_service
 from app.openai_service import BrainError, openai_brain
 from app.runtime import stt_semaphore, tts_semaphore, vad_executor
+from app.turn_timeline import TurnTimeline
 from app.voice_pipeline.base import VoicePipelineSession
 
 logger = logging.getLogger(__name__)
@@ -395,6 +396,7 @@ class VoiceSession(VoicePipelineSession):
             duration_ms,
             vad_speech_ms,
         )
+        timeline = TurnTimeline(connection_id=self.connection_id)
         # Make sure any previous turn (still "thinking" through STT/LLM/TTS,
         # or even still speaking) is fully stopped before starting a new one.
         # Without this, a caller who keeps talking while the bot is still
@@ -411,18 +413,22 @@ class VoiceSession(VoicePipelineSession):
                     "duration_ms": duration_ms,
                     "vad_speech_ms": vad_speech_ms,
                 },
+                timeline,
             )
         )
         self._turn_processing = False
 
-    async def _run_turn(self, pcm_bytes: bytes, turn_stats: dict):
+    async def _run_turn(self, pcm_bytes: bytes, turn_stats: dict, timeline: TurnTimeline):
         producer_task: asyncio.Task | None = None
         try:
             turn_started = time.perf_counter()
 
+            timeline.mark("stt_start_ms")
             stt_started = time.perf_counter()
             stt_result = await self._transcribe(pcm_bytes)
             stt_ms = (time.perf_counter() - stt_started) * 1000
+            timeline.mark("stt_complete_ms")
+            timeline.stt_ms = round(stt_ms, 1)
 
             if not stt_result.text:
                 logger.info("Empty transcript for %s, ignoring turn", self.connection_id)
@@ -432,6 +438,7 @@ class VoiceSession(VoicePipelineSession):
                     stt_ms,
                     (time.perf_counter() - turn_started) * 1000,
                 )
+                timeline.emit()
                 return
             if not self._accept_stt_result(stt_result, turn_stats):
                 logger.info(
@@ -440,6 +447,7 @@ class VoiceSession(VoicePipelineSession):
                     stt_ms,
                     (time.perf_counter() - turn_started) * 1000,
                 )
+                timeline.emit()
                 return
 
             logger.info(
@@ -464,9 +472,11 @@ class VoiceSession(VoicePipelineSession):
             timing = {"first_sentence_ms": None}
             sentence_queue: asyncio.Queue = asyncio.Queue()
             producer_task = asyncio.create_task(
-                self._produce_llm_sentences(sentence_queue, turn_started, timing)
+                self._produce_llm_sentences(
+                    sentence_queue, turn_started, timing, timeline
+                )
             )
-            tts_stats = await self._speak_from_sentence_queue(sentence_queue)
+            tts_stats = await self._speak_from_sentence_queue(sentence_queue, timeline)
             reply_text = self._truncate_reply_words(
                 (await producer_task).strip(), config.REPLY_WORD_MAX
             )
@@ -480,6 +490,7 @@ class VoiceSession(VoicePipelineSession):
                     stt_ms,
                     turn_total_ms,
                 )
+                timeline.emit()
                 return
 
             logger.info("🧠 Assistant (%s) reply: %s", self.connection_id, reply_text)
@@ -487,6 +498,7 @@ class VoiceSession(VoicePipelineSession):
             self._trim_history()
 
             turn_total_ms = (time.perf_counter() - turn_started) * 1000
+            timeline.sentences = tts_stats.get("sentences", 0)
             logger.info(
                 (
                     "LATENCY - turn %s stt_ms=%.0f llm_first_sentence_ms=%s "
@@ -500,6 +512,7 @@ class VoiceSession(VoicePipelineSession):
                 tts_stats.get("sentences"),
                 turn_total_ms,
             )
+            timeline.emit()
             if self._should_end_call:
                 logger.info("☎️ Closing call for %s because LLM requested end-call", self.connection_id)
                 await self._close_after_final_reply()
@@ -567,15 +580,26 @@ class VoiceSession(VoicePipelineSession):
         return words_sent[0] < config.REPLY_WORD_MAX
 
     async def _produce_llm_sentences(
-        self, sentence_queue: asyncio.Queue, turn_started: float, timing: dict
+        self,
+        sentence_queue: asyncio.Queue,
+        turn_started: float,
+        timing: dict,
+        timeline: TurnTimeline | None = None,
     ) -> str:
         """Consume the OpenAI token stream, pushing finished sentences to the queue."""
         buffer = ""
         parts: list[str] = []
         words_sent = [0]
         self._should_end_call = False
+        openai_requested = False
         try:
             async for delta in openai_brain.stream_reply(self.history):
+                if not openai_requested:
+                    openai_requested = True
+                    if timeline is not None:
+                        timeline.mark_once("openai_request_ms")
+                if timeline is not None:
+                    timeline.mark_once("openai_first_token_ms")
                 if words_sent[0] >= config.REPLY_WORD_MAX:
                     break
                 buffer += delta
@@ -591,6 +615,8 @@ class VoiceSession(VoicePipelineSession):
                             timing["first_sentence_ms"] = round(
                                 (time.perf_counter() - turn_started) * 1000
                             )
+                            if timeline is not None:
+                                timeline.mark_once("llm_first_sentence_ms")
                         if not await self._enqueue_llm_sentence(
                             sentence_queue, sentence, words_sent
                         ):
@@ -604,6 +630,8 @@ class VoiceSession(VoicePipelineSession):
                     timing["first_sentence_ms"] = round(
                         (time.perf_counter() - turn_started) * 1000
                     )
+                    if timeline is not None:
+                        timeline.mark_once("llm_first_sentence_ms")
                 await self._enqueue_llm_sentence(sentence_queue, tail, words_sent)
         except BrainError as exc:
             logger.error("Brain error for %s: %s", self.connection_id, exc)
@@ -631,7 +659,9 @@ class VoiceSession(VoicePipelineSession):
         except Exception as exc:
             logger.warning("Error closing websocket for %s: %s", self.connection_id, exc)
 
-    async def _speak_from_sentence_queue(self, sentence_queue: asyncio.Queue) -> dict:
+    async def _speak_from_sentence_queue(
+        self, sentence_queue: asyncio.Queue, timeline: TurnTimeline | None = None
+    ) -> dict:
         """
         Drive TTS fetching and real-time playback pacing as two decoupled
         stages connected by a small frame queue (a jitter buffer):
@@ -648,10 +678,12 @@ class VoiceSession(VoicePipelineSession):
         timing = {"first_byte_ms": None, "sentences": 0}
         started = time.perf_counter()
         fetcher_task = asyncio.create_task(
-            self._produce_audio_frames(sentence_queue, frame_queue, timing, started)
+            self._produce_audio_frames(
+                sentence_queue, frame_queue, timing, started, timeline
+            )
         )
         try:
-            pace_stats = await self._pace_and_send_frames(frame_queue)
+            pace_stats = await self._pace_and_send_frames(frame_queue, timeline)
         finally:
             if not fetcher_task.done():
                 fetcher_task.cancel()
@@ -671,6 +703,7 @@ class VoiceSession(VoicePipelineSession):
         frame_queue: asyncio.Queue,
         timing: dict,
         started: float,
+        timeline: TurnTimeline | None = None,
     ):
         """Fetch TTS audio for each queued sentence and split it into fixed-size frames."""
         residual = bytearray()
@@ -679,11 +712,17 @@ class VoiceSession(VoicePipelineSession):
                 sentence = await sentence_queue.get()
                 if sentence is None:
                     break
+                if timeline is not None:
+                    timeline.mark_once("tts_first_request_ms")
                 try:
                     async with tts_semaphore:
                         async for raw_chunk in elevenlabs_service.stream_text_to_speech(sentence):
                             if timing["first_byte_ms"] is None:
-                                timing["first_byte_ms"] = round((time.perf_counter() - started) * 1000)
+                                timing["first_byte_ms"] = round(
+                                    (time.perf_counter() - started) * 1000
+                                )
+                                if timeline is not None:
+                                    timeline.mark_once("tts_first_byte_ms")
                             residual.extend(raw_chunk)
                             while len(residual) >= config.BYTES_PER_CHUNK:
                                 frame = bytes(residual[: config.BYTES_PER_CHUNK])
@@ -698,7 +737,9 @@ class VoiceSession(VoicePipelineSession):
         finally:
             await frame_queue.put(None)
 
-    async def _pace_and_send_frames(self, frame_queue: asyncio.Queue) -> dict:
+    async def _pace_and_send_frames(
+        self, frame_queue: asyncio.Queue, timeline: TurnTimeline | None = None
+    ) -> dict:
         """
         Send frames to Exotel on a precise 20ms clock. Uses a drift-corrected
         schedule (next_send_time += interval) instead of "sleep 20ms after
@@ -712,11 +753,16 @@ class VoiceSession(VoicePipelineSession):
         loop = asyncio.get_running_loop()
         next_send_time: float | None = None
         self.is_speaking = True
+        playback_started = False
         try:
             while True:
                 if self._closed or not self._websocket_is_open():
                     break
+                wait_started = time.perf_counter()
                 frame = await frame_queue.get()
+                if playback_started and timeline is not None:
+                    gap_ms = (time.perf_counter() - wait_started) * 1000
+                    timeline.record_playback_queue_gap(gap_ms)
                 if frame is None:
                     break
                 now = loop.time()
@@ -727,6 +773,10 @@ class VoiceSession(VoicePipelineSession):
                     await asyncio.sleep(delay)
                 if not await self._send_pcm_frame(frame):
                     break
+                if timeline is not None:
+                    timeline.mark_once("first_packet_sent_ms")
+                    timeline.mark("last_packet_sent_ms")
+                playback_started = True
                 next_send_time += config.CHUNK_DURATION_MS / 1000
         finally:
             self.is_speaking = False
