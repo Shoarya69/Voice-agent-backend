@@ -1,10 +1,10 @@
 """
-OpenAI Realtime pipeline — speech-to-speech via the Realtime WebSocket API.
+OpenAI Realtime pipeline — speech-to-speech via the GA Realtime WebSocket API.
 
 Exotel (8 kHz PCM) ↔ resample ↔ OpenAI Realtime (24 kHz PCM) ↔ Exotel
 
-Agent config, call history, and CRM fields use the shared ``VoicePipelineSession``
-base — same as the compound pipeline.
+Uses the GA protocol (/v1/realtime, no OpenAI-Beta header). MoontechPro agent
+config, call history, and CRM fields use the shared VoicePipelineSession base.
 """
 
 from __future__ import annotations
@@ -23,16 +23,23 @@ from app import config
 from app.audio_utils import chunk_pcm, decode_payload
 from app.openai_service import openai_brain
 from app.voice_pipeline.base import VoicePipelineSession
+from app.voice_pipeline.openai_realtime.ga_protocol import (
+    EVENT_INPUT_TRANSCRIPTION_COMPLETED,
+    EVENT_OUTPUT_AUDIO_DELTA,
+    EVENT_OUTPUT_AUDIO_TRANSCRIPT_DELTA,
+    EVENT_OUTPUT_AUDIO_TRANSCRIPT_DONE,
+    EVENT_RESPONSE_DONE,
+    GA_PCM_SAMPLE_RATE,
+    build_ga_assistant_message_item,
+    build_ga_response_create,
+    build_ga_session_update,
+)
 
 logger = logging.getLogger(__name__)
 
-# OpenAI Realtime expects 24 kHz PCM16 mono for pcm16 format.
-_REALTIME_INPUT_RATE = 24_000
-_REALTIME_OUTPUT_RATE = 24_000
-
 
 class OpenAIRealtimePipelineSession(VoicePipelineSession):
-    """OpenAI Realtime API provider (single-model speech-to-speech)."""
+    """OpenAI Realtime API provider (GA speech-to-speech)."""
 
     pipeline_name: ClassVar[str] = "openai_realtime"
 
@@ -50,8 +57,6 @@ class OpenAIRealtimePipelineSession(VoicePipelineSession):
         self._resample_state_out = None
         self._assistant_transcript_buffer = ""
         self._output_frame_queue: asyncio.Queue = asyncio.Queue()
-        # Greeting de-duplication: PCM path records history once + injects Realtime item;
-        # live response.create path waits for response.done transcript only.
         self._awaiting_greeting_transcript = False
         self._greeting_text_recorded: str | None = None
 
@@ -75,7 +80,7 @@ class OpenAIRealtimePipelineSession(VoicePipelineSession):
             config.SAMPLE_WIDTH,
             config.CHANNELS,
             config.SAMPLE_RATE,
-            _REALTIME_INPUT_RATE,
+            GA_PCM_SAMPLE_RATE,
             self._resample_state_in,
         )
         audio_b64 = base64.b64encode(pcm_24k).decode("ascii")
@@ -104,13 +109,9 @@ class OpenAIRealtimePipelineSession(VoicePipelineSession):
         await self._ensure_realtime_connected()
         self._awaiting_greeting_transcript = True
         await self._send_realtime(
-            {
-                "type": "response.create",
-                "response": {
-                    "modalities": ["text", "audio"],
-                    "instructions": f"Say exactly this greeting, nothing else: {welcome}",
-                },
-            }
+            build_ga_response_create(
+                instructions=f"Say exactly this greeting, nothing else: {welcome}",
+            )
         )
 
     async def handle_clear(self) -> None:
@@ -136,7 +137,7 @@ class OpenAIRealtimePipelineSession(VoicePipelineSession):
             self._realtime_ws = None
 
     # ------------------------------------------------------------------
-    # Realtime connection lifecycle
+    # Realtime connection lifecycle (GA)
     # ------------------------------------------------------------------
     async def _ensure_realtime_connected(self) -> None:
         if self._realtime_connected or self._realtime_connecting:
@@ -157,7 +158,6 @@ class OpenAIRealtimePipelineSession(VoicePipelineSession):
         )
         headers = {
             "Authorization": f"Bearer {config.OPENAI_API_KEY}",
-            "OpenAI-Beta": "realtime=v1",
         }
 
         try:
@@ -171,7 +171,7 @@ class OpenAIRealtimePipelineSession(VoicePipelineSession):
             await self._configure_realtime_session()
             self._realtime_connected = True
             logger.info(
-                "OpenAI Realtime connected for %s model=%s",
+                "OpenAI Realtime (GA) connected for %s model=%s",
                 self.connection_id,
                 config.OPENAI_REALTIME_MODEL,
             )
@@ -180,46 +180,14 @@ class OpenAIRealtimePipelineSession(VoicePipelineSession):
 
     async def _configure_realtime_session(self) -> None:
         instructions = openai_brain._messages(self.history)[0]["content"]
-
         await self._send_realtime(
-            {
-                "type": "session.update",
-                "session": {
-                    "modalities": ["text", "audio"],
-                    "instructions": instructions,
-                    "voice": config.OPENAI_REALTIME_VOICE,
-                    "input_audio_format": "pcm16",
-                    "output_audio_format": "pcm16",
-                    "input_audio_transcription": {"model": "whisper-1"},
-                    "turn_detection": {
-                        "type": "server_vad",
-                        "threshold": config.OPENAI_REALTIME_VAD_THRESHOLD,
-                        "prefix_padding_ms": config.OPENAI_REALTIME_PREFIX_PADDING_MS,
-                        "silence_duration_ms": config.OPENAI_REALTIME_SILENCE_DURATION_MS,
-                    },
-                    "temperature": config.OPENAI_TEMPERATURE,
-                    "max_response_output_tokens": config.OPENAI_MAX_TOKENS,
-                },
-            }
+            build_ga_session_update(instructions=instructions)
         )
 
     async def _inject_assistant_message_into_realtime(self, text: str) -> None:
-        """
-        Tell the Realtime model about assistant speech it did not generate
-        (e.g. pre-recorded PCM greeting played directly to Exotel).
-        """
         if not self._realtime_connected or not text.strip():
             return
-        await self._send_realtime(
-            {
-                "type": "conversation.item.create",
-                "item": {
-                    "type": "message",
-                    "role": "assistant",
-                    "content": [{"type": "text", "text": text.strip()}],
-                },
-            }
-        )
+        await self._send_realtime(build_ga_assistant_message_item(text))
         logger.info(
             "Injected assistant greeting into Realtime conversation for %s",
             self.connection_id,
@@ -299,41 +267,68 @@ class OpenAIRealtimePipelineSession(VoicePipelineSession):
     async def _handle_realtime_event(self, event: dict) -> None:
         event_type = event.get("type", "")
 
-        if event_type == "response.audio.delta":
+        if event_type == EVENT_OUTPUT_AUDIO_DELTA:
             delta_b64 = event.get("delta") or ""
             if not delta_b64:
                 return
             pcm_24k = base64.b64decode(delta_b64)
-            await self._enqueue_output_pcm(pcm_24k, sample_rate=_REALTIME_OUTPUT_RATE)
+            await self._enqueue_output_pcm(pcm_24k)
 
-        elif event_type == "response.audio_transcript.delta":
+        elif event_type == EVENT_OUTPUT_AUDIO_TRANSCRIPT_DELTA:
             self._assistant_transcript_buffer += event.get("delta") or ""
 
-        elif event_type == "response.done":
+        elif event_type == EVENT_OUTPUT_AUDIO_TRANSCRIPT_DONE:
+            transcript = (event.get("transcript") or "").strip()
+            if transcript and not self._assistant_transcript_buffer:
+                self._assistant_transcript_buffer = transcript
+
+        elif event_type == EVENT_RESPONSE_DONE:
             text = self._assistant_transcript_buffer.strip()
             self._assistant_transcript_buffer = ""
+            if not text:
+                response = event.get("response") or {}
+                text = self._extract_transcript_from_response(response)
             if text:
                 await self._record_assistant_transcript(text)
 
-        elif event_type == "conversation.item.input_audio_transcription.completed":
+        elif event_type == EVENT_INPUT_TRANSCRIPTION_COMPLETED:
             text = (event.get("transcript") or "").strip()
             if text:
                 self._append_history_message("user", text)
                 logger.info("ACCEPTED - stt %s text=%r", self.connection_id, text)
 
         elif event_type == "error":
+            error = event.get("error") or {}
             logger.error(
                 "OpenAI Realtime error for %s: %s",
                 self.connection_id,
-                event.get("error"),
+                error,
             )
 
-    async def _enqueue_output_pcm(self, pcm: bytes, *, sample_rate: int) -> None:
+    @staticmethod
+    def _extract_transcript_from_response(response: dict) -> str:
+        """Fallback transcript extraction from GA ``response.done`` payload."""
+        parts: list[str] = []
+        for item in response.get("output") or []:
+            if item.get("type") != "message":
+                continue
+            for content in item.get("content") or []:
+                if content.get("type") == "output_audio":
+                    transcript = (content.get("transcript") or "").strip()
+                    if transcript:
+                        parts.append(transcript)
+                elif content.get("type") == "output_text":
+                    text = (content.get("text") or "").strip()
+                    if text:
+                        parts.append(text)
+        return " ".join(parts).strip()
+
+    async def _enqueue_output_pcm(self, pcm: bytes) -> None:
         pcm_8k, self._resample_state_out = audioop.ratecv(
             pcm,
             config.SAMPLE_WIDTH,
             config.CHANNELS,
-            sample_rate,
+            GA_PCM_SAMPLE_RATE,
             config.SAMPLE_RATE,
             self._resample_state_out,
         )
