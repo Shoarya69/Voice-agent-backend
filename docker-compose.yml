@@ -1,0 +1,14 @@
+services:
+  ai-voice-agent:
+    build: .
+    image: ai-voice-agent:latest
+    container_name: ai-voice-agent
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "${PORT:-8002}:${PORT:-8002}"                   # Exotel WebSocket voice stream
+      - "${WEBHOOK_PORT:-8081}:${WEBHOOK_PORT:-8081}"   # Exotel status/conversation webhook relay -> Lovable
+      - "5001:5001"                                     # Monitoring dashboard
+    volumes:
+      - ./logs:/app/logs
