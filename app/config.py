@@ -206,8 +206,15 @@ BYTES_PER_CHUNK = int(SAMPLE_RATE * SAMPLE_WIDTH * CHANNELS * (CHUNK_DURATION_MS
 # ---------------------------------------------------------------------------
 # Supabase (direct agent reads — replaces Moontech HTTP GET on live-call path)
 # ---------------------------------------------------------------------------
-SUPABASE_URL = os.getenv("SUPABASE_URL", "")
+SUPABASE_URL = os.getenv("SUPABASE_URL", "") or os.getenv("VITE_SUPABASE_URL", "")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
+# Anon/publishable key (client key) — works only if Moontech RLS allows public SELECT.
+# Accepts common names from frontend .env files.
+SUPABASE_ANON_KEY = (
+    os.getenv("SUPABASE_ANON_KEY", "")
+    or os.getenv("SUPABASE_PUBLISHABLE_KEY", "")
+    or os.getenv("VITE_SUPABASE_PUBLISHABLE_KEY", "")
+)
 # Moontech base URL for cold greeting synth fallback only (write-side on Moontech).
 MOONTECH_BASE_URL = os.getenv("MOONTECH_BASE_URL", "") or os.getenv("LOVABLE_APP_URL", "")
 
@@ -308,9 +315,14 @@ def validate() -> list:
         )
     if not LOVABLE_APP_URL:
         warnings.append("LOVABLE_APP_URL is not set - per-agent token lookup and call-log posting are disabled.")
-    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+    if not SUPABASE_URL or (not SUPABASE_SERVICE_ROLE_KEY and not SUPABASE_ANON_KEY):
         warnings.append(
-            "SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY not set - agent reads fall back to "
-            "Moontech HTTP (slower). Set both for direct Supabase reads."
+            "Supabase not fully configured - agent reads fall back to Moontech HTTP. "
+            "Set SUPABASE_URL plus SUPABASE_SERVICE_ROLE_KEY (preferred) or SUPABASE_ANON_KEY."
+        )
+    elif SUPABASE_ANON_KEY and not SUPABASE_SERVICE_ROLE_KEY:
+        warnings.append(
+            "Using SUPABASE_ANON_KEY (publishable) for agent reads — requires Moontech "
+            "RLS policies; if lookups fail, Moontech HTTP fallback is used automatically."
         )
     return warnings

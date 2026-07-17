@@ -40,6 +40,7 @@ _DEFAULT_VOICE_ID = "cgSgspJ2msm6clMCkdW9"
 _DEFAULT_SYSTEM_PROMPT = "You are a helpful voice assistant."
 
 _supabase_client = None
+_supabase_key_mode: str | None = None
 _supabase_lock = asyncio.Lock()
 
 
@@ -51,22 +52,48 @@ class SupabaseAgentError(Exception):
         self.status_code = status_code
 
 
+def _resolve_api_key() -> tuple[str, str]:
+    """
+    Return (api_key, mode). Prefer service_role; fall back to anon/publishable.
+    """
+    if config.SUPABASE_SERVICE_ROLE_KEY:
+        return config.SUPABASE_SERVICE_ROLE_KEY, "service_role"
+    if config.SUPABASE_ANON_KEY:
+        return config.SUPABASE_ANON_KEY, "anon"
+    return "", ""
+
+
 def is_configured() -> bool:
-    return bool(config.SUPABASE_URL and config.SUPABASE_SERVICE_ROLE_KEY)
+    key, _ = _resolve_api_key()
+    return bool(config.SUPABASE_URL and key)
+
+
+def using_anon_key() -> bool:
+    _, mode = _resolve_api_key()
+    return mode == "anon"
 
 
 async def _get_supabase():
-    global _supabase_client
-    if _supabase_client is not None:
-        return _supabase_client
-    async with _supabase_lock:
-        if _supabase_client is None:
-            from supabase import create_client
+    global _supabase_client, _supabase_key_mode
+    api_key, mode = _resolve_api_key()
+    if not api_key:
+        raise SupabaseAgentError("Supabase API key not configured")
 
-            _supabase_client = create_client(
-                config.SUPABASE_URL,
-                config.SUPABASE_SERVICE_ROLE_KEY,
-            )
+    if _supabase_client is not None and _supabase_key_mode == mode:
+        return _supabase_client
+
+    async with _supabase_lock:
+        if _supabase_client is not None and _supabase_key_mode == mode:
+            return _supabase_client
+        from supabase import create_client
+
+        _supabase_client = create_client(config.SUPABASE_URL, api_key)
+        _supabase_key_mode = mode
+        logger.info(
+            "Supabase client ready mode=%s url=%s",
+            mode,
+            config.SUPABASE_URL.rsplit("/", 1)[-1][:20],
+        )
     return _supabase_client
 
 
@@ -175,7 +202,28 @@ def _greeting_object(agent: dict[str, Any], first_message: str) -> dict[str, Any
 
 
 async def _run_sync(fn, *args, **kwargs):
-    return await asyncio.to_thread(fn, *args, **kwargs)
+    try:
+        return await asyncio.to_thread(fn, *args, **kwargs)
+    except Exception as exc:
+        detail = str(exc).lower()
+        if any(
+            token in detail
+            for token in (
+                "permission denied",
+                "row-level security",
+                "rls",
+                "42501",
+                "401",
+                "403",
+                "jwt",
+                "not authorized",
+            )
+        ):
+            raise SupabaseAgentError(
+                f"Supabase permission denied (anon key + RLS?): {exc}",
+                status_code=403,
+            ) from exc
+        raise SupabaseAgentError(f"Supabase query failed: {exc}") from exc
 
 
 async def _fetch_greeting_from_moontech(agent_id: str) -> dict[str, Any] | None:

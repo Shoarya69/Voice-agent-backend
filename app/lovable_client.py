@@ -213,6 +213,26 @@ def _auth_headers() -> dict:
     return headers
 
 
+async def _fetch_agent_payload_via_supabase(fetch_fn, *, log_label: str) -> dict | None:
+    """
+    Try Supabase read; on anon-key RLS failure fall back to Moontech HTTP.
+    Returns payload dict or None if caller should use HTTP.
+    """
+    if not supabase_agent_provider.is_configured():
+        return None
+    try:
+        return await fetch_fn()
+    except supabase_agent_provider.SupabaseAgentError as exc:
+        if supabase_agent_provider.using_anon_key() and config.LOVABLE_APP_URL:
+            logger.warning(
+                "Supabase %s failed with anon key (%s) — falling back to Moontech HTTP",
+                log_label,
+                exc,
+            )
+            return None
+        raise LovableClientError(str(exc)) from exc
+
+
 async def _get_json_with_retry(
     url: str,
     *,
@@ -473,14 +493,12 @@ async def prewarm_agent_bundle(
 
 
 async def _fetch_agent_with_greeting_from_lovable(agent_id: str) -> AgentConfig:
-    if supabase_agent_provider.is_configured():
-        try:
-            payload = await supabase_agent_provider.fetch_agent_payload_with_greeting(
-                agent_id
-            )
-            return _parse_agent_config_payload(payload)
-        except supabase_agent_provider.SupabaseAgentError as exc:
-            raise LovableClientError(str(exc)) from exc
+    payload = await _fetch_agent_payload_via_supabase(
+        lambda: supabase_agent_provider.fetch_agent_payload_with_greeting(agent_id),
+        log_label="agent-with-greeting",
+    )
+    if payload is not None:
+        return _parse_agent_config_payload(payload)
 
     encoded = quote(agent_id, safe="")
     url = f"{config.LOVABLE_APP_URL.rstrip('/')}{_AGENT_WITH_GREETING_PATH}/{encoded}"
@@ -502,12 +520,12 @@ async def _fetch_agent_with_greeting_from_lovable(agent_id: str) -> AgentConfig:
 
 
 async def _fetch_agent_from_lovable(token: str) -> AgentConfig:
-    if supabase_agent_provider.is_configured():
-        try:
-            payload = await supabase_agent_provider.fetch_agent_payload_by_token(token)
-            return _parse_agent_config_payload(payload, token=token)
-        except supabase_agent_provider.SupabaseAgentError as exc:
-            raise LovableClientError(str(exc)) from exc
+    payload = await _fetch_agent_payload_via_supabase(
+        lambda: supabase_agent_provider.fetch_agent_payload_by_token(token),
+        log_label="agent-by-token",
+    )
+    if payload is not None:
+        return _parse_agent_config_payload(payload, token=token)
 
     url = f"{config.LOVABLE_APP_URL.rstrip('/')}{_AGENT_LOOKUP_PATH}"
     try:
@@ -528,12 +546,12 @@ async def _fetch_agent_from_lovable(token: str) -> AgentConfig:
 
 
 async def _fetch_agent_by_number_from_lovable(number: str) -> AgentConfig:
-    if supabase_agent_provider.is_configured():
-        try:
-            payload = await supabase_agent_provider.fetch_agent_payload_by_number(number)
-            return _parse_agent_config_payload(payload)
-        except supabase_agent_provider.SupabaseAgentError as exc:
-            raise LovableClientError(str(exc)) from exc
+    payload = await _fetch_agent_payload_via_supabase(
+        lambda: supabase_agent_provider.fetch_agent_payload_by_number(number),
+        log_label="agent-by-number",
+    )
+    if payload is not None:
+        return _parse_agent_config_payload(payload)
 
     encoded = quote(number, safe="")
     url = f"{config.LOVABLE_APP_URL.rstrip('/')}{_AGENT_BY_NUMBER_PATH}/{encoded}"
