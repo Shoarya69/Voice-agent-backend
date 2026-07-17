@@ -29,9 +29,11 @@ Nothing here ever sends an `agent_id` - Lovable always resolves the agent
 itself, either from the token (agent-by-token) or from the caller's phone
 number via `phone_numbers` (voice-inbound, Exotel -> Lovable directly).
 
-Agent-config lookups (never send an agent_id outbound):
-  - GET /api/public/voicebot/agent-by-token?token=...
-  - GET /api/public/voicebot/agent-by-number/{mobile_number}
+Agent-config lookups (read path — Supabase when configured, else legacy HTTP):
+  - Direct Supabase: phone_numbers, ai_agents, voicebot_call_tokens
+  - Legacy HTTP fallback (deprecated): GET /api/public/voicebot/agent-by-token
+  - Legacy HTTP fallback (deprecated): GET /api/public/voicebot/agent-by-number/{mobile_number}
+  - Moontech HTTP (cold greeting synth only): GET /api/public/voicebot/agent-with-greeting/{agentId}
 
 The `voice-inbound` telephony hook (Exotel -> Lovable, TwiML) is separate
 and is not called from this service.
@@ -49,6 +51,7 @@ from urllib.parse import quote
 import httpx
 
 from app import config
+from app import supabase_agent_provider
 
 logger = logging.getLogger(__name__)
 
@@ -295,7 +298,7 @@ async def fetch_agent(token: str) -> AgentConfig:
     """
     if not token:
         raise LovableClientError("missing token")
-    if not config.LOVABLE_APP_URL:
+    if not supabase_agent_provider.is_configured() and not config.LOVABLE_APP_URL:
         raise LovableClientError("LOVABLE_APP_URL is not configured")
 
     cached = _agent_cache.get(token)
@@ -320,7 +323,7 @@ async def fetch_agent_by_number(number: str) -> AgentConfig:
     """
     if not number:
         raise LovableClientError("missing mobile number")
-    if not config.LOVABLE_APP_URL:
+    if not supabase_agent_provider.is_configured() and not config.LOVABLE_APP_URL:
         raise LovableClientError("LOVABLE_APP_URL is not configured")
 
     cached = _agent_by_number_cache.get(number)
@@ -349,7 +352,7 @@ async def fetch_agent_with_greeting(agent_id: str) -> AgentConfig:
     """
     if not agent_id:
         raise LovableClientError("missing agent_id")
-    if not config.LOVABLE_APP_URL:
+    if not supabase_agent_provider.is_configured() and not config.LOVABLE_APP_URL:
         raise LovableClientError("LOVABLE_APP_URL is not configured")
 
     cached = _agent_with_greeting_cache.get(agent_id)
@@ -470,6 +473,15 @@ async def prewarm_agent_bundle(
 
 
 async def _fetch_agent_with_greeting_from_lovable(agent_id: str) -> AgentConfig:
+    if supabase_agent_provider.is_configured():
+        try:
+            payload = await supabase_agent_provider.fetch_agent_payload_with_greeting(
+                agent_id
+            )
+            return _parse_agent_config_payload(payload)
+        except supabase_agent_provider.SupabaseAgentError as exc:
+            raise LovableClientError(str(exc)) from exc
+
     encoded = quote(agent_id, safe="")
     url = f"{config.LOVABLE_APP_URL.rstrip('/')}{_AGENT_WITH_GREETING_PATH}/{encoded}"
     try:
@@ -490,6 +502,13 @@ async def _fetch_agent_with_greeting_from_lovable(agent_id: str) -> AgentConfig:
 
 
 async def _fetch_agent_from_lovable(token: str) -> AgentConfig:
+    if supabase_agent_provider.is_configured():
+        try:
+            payload = await supabase_agent_provider.fetch_agent_payload_by_token(token)
+            return _parse_agent_config_payload(payload, token=token)
+        except supabase_agent_provider.SupabaseAgentError as exc:
+            raise LovableClientError(str(exc)) from exc
+
     url = f"{config.LOVABLE_APP_URL.rstrip('/')}{_AGENT_LOOKUP_PATH}"
     try:
         payload = await _get_json_with_retry(
@@ -509,7 +528,12 @@ async def _fetch_agent_from_lovable(token: str) -> AgentConfig:
 
 
 async def _fetch_agent_by_number_from_lovable(number: str) -> AgentConfig:
-    from urllib.parse import quote
+    if supabase_agent_provider.is_configured():
+        try:
+            payload = await supabase_agent_provider.fetch_agent_payload_by_number(number)
+            return _parse_agent_config_payload(payload)
+        except supabase_agent_provider.SupabaseAgentError as exc:
+            raise LovableClientError(str(exc)) from exc
 
     encoded = quote(number, safe="")
     url = f"{config.LOVABLE_APP_URL.rstrip('/')}{_AGENT_BY_NUMBER_PATH}/{encoded}"

@@ -204,6 +204,14 @@ CHUNK_DURATION_MS = 20
 BYTES_PER_CHUNK = int(SAMPLE_RATE * SAMPLE_WIDTH * CHANNELS * (CHUNK_DURATION_MS / 1000))
 
 # ---------------------------------------------------------------------------
+# Supabase (direct agent reads — replaces Moontech HTTP GET on live-call path)
+# ---------------------------------------------------------------------------
+SUPABASE_URL = os.getenv("SUPABASE_URL", "")
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
+# Moontech base URL for cold greeting synth fallback only (write-side on Moontech).
+MOONTECH_BASE_URL = os.getenv("MOONTECH_BASE_URL", "") or os.getenv("LOVABLE_APP_URL", "")
+
+# ---------------------------------------------------------------------------
 # Lovable control plane (per-agent config lookup + call logging)
 # ---------------------------------------------------------------------------
 LOVABLE_APP_URL = os.getenv("LOVABLE_APP_URL", "")
@@ -300,4 +308,9 @@ def validate() -> list:
         )
     if not LOVABLE_APP_URL:
         warnings.append("LOVABLE_APP_URL is not set - per-agent token lookup and call-log posting are disabled.")
+    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+        warnings.append(
+            "SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY not set - agent reads fall back to "
+            "Moontech HTTP (slower). Set both for direct Supabase reads."
+        )
     return warnings
