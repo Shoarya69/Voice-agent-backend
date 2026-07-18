@@ -25,7 +25,7 @@ create_voice_pipeline_session()  ← reads VOICE_PIPELINE
 Shared across all providers (`VoicePipelineSession` in `base.py`):
 
 - MoontechPro agent lookup / prefetch
-- CRM call logs and channel release
+- CRM call logs
 - Conversation `history` for transcripts
 - Exotel `stream_sid` / caller metadata
 

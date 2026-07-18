@@ -364,7 +364,7 @@ def _post_call_log_once(session: VoicePipelineSession) -> None:
 
 
 def _session_release_token(session: VoicePipelineSession) -> str:
-    """Best token for MoontechPro channel release (per-call reservation key)."""
+    """Best per-call token for channel reservation logging."""
     token = getattr(session, "lovable_token", None)
     if token:
         return token
@@ -378,7 +378,7 @@ def _session_release_token(session: VoicePipelineSession) -> str:
 
 def _assume_channel_reserved(session: VoicePipelineSession) -> None:
     """
-    MoontechPro reserves a channel when it accepts the call (voice-inbound).
+    Supabase reserves a channel when the call is accepted (try_reserve_voice_channel).
     Any WSS connection with a token or number route implies a reservation.
     """
     if getattr(session, "_channel_reserved", False):
@@ -427,68 +427,11 @@ def _log_call_started(session: VoicePipelineSession, connection_id: str) -> None
     )
 
 
-def _build_channel_release_payload(session: VoicePipelineSession, reason: str) -> dict | None:
-    token = _session_release_token(session)
-    number = session.wss_route_value if session.wss_route_kind == "number" else None
-    if not token and not number:
-        return None
-
-    agent_config = getattr(session, "agent_config", None)
-    payload = {
-        "token": token or None,
-        "number": number,
-        "call_sid": session.call_sid,
-        "agent_id": getattr(session, "agent_id", None)
-        or (agent_config.agent_id if agent_config else None),
-        "from_number": getattr(session, "caller_from", None),
-        "to_number": getattr(session, "caller_to", None),
-        "connection_id": session.connection_id,
-        "reason": reason,
-    }
-
-    reservation_id = ""
-    if agent_config is not None:
-        reservation_id = getattr(agent_config, "channel_reservation_id", "") or ""
-    if reservation_id:
-        payload["channel_reservation_id"] = reservation_id
-
-    return payload
-
-
-async def _release_channel_once(session: VoicePipelineSession, reason: str) -> None:
-    if getattr(session, "_channel_released", False):
-        return
-    if not getattr(session, "_channel_reserved", False):
-        return
-
-    session._channel_released = True
-    payload = _build_channel_release_payload(session, reason)
-    if payload is None:
-        logger.error(
-            "VOICE_CHANNEL event=cleanup_failure call_sid=%s step=channel_release "
-            "reason=%s error=missing token/number for release",
-            session.call_sid or "unknown",
-            reason,
-        )
-        return
-
-    released = await lovable_client.release_channel(payload)
-    if released:
-        logger.info(
-            "VOICE_CHANNEL event=channel_released call_sid=%s connection_id=%s "
-            "token=%s... reason=%s",
-            session.call_sid or "unknown",
-            session.connection_id,
-            _token_prefix(payload.get("token")),
-            reason,
-        )
-
-
 async def _finalize_call_session(
     session: VoicePipelineSession, connection_id: str, reason: str
 ) -> None:
     """
-    Guaranteed end-of-call cleanup: log end, post call log, release channel.
+    Guaranteed end-of-call cleanup: log end and post call log.
     Idempotent — safe from stop handler, finally block, or error paths.
     """
     if getattr(session, "_call_finalized", False):
@@ -507,17 +450,6 @@ async def _finalize_call_session(
     except Exception as exc:  # noqa: BLE001 - cleanup must continue
         logger.error(
             "VOICE_CHANNEL event=cleanup_failure call_sid=%s step=call_log "
-            "reason=%s error=%s",
-            session.call_sid or "unknown",
-            reason,
-            exc,
-        )
-
-    try:
-        await _release_channel_once(session, reason)
-    except Exception as exc:  # noqa: BLE001 - cleanup must not crash handler
-        logger.error(
-            "VOICE_CHANNEL event=cleanup_failure call_sid=%s step=channel_release "
             "reason=%s error=%s",
             session.call_sid or "unknown",
             reason,
@@ -576,7 +508,6 @@ async def handle_websocket(websocket):
         session._agent_prefetch_task = None
         session._channel_reserved = False
         session._channel_reserved_logged = False
-        session._channel_released = False
         session._call_started_logged = False
         session._call_finalized = False
         active_sessions[connection_id] = session

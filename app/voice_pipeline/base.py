@@ -1,7 +1,7 @@
 """
 Shared call-session contract for all voice pipeline providers.
 
-Business logic in ai_server.py (agent lookup, CRM call logs, channel release)
+Business logic in ai_server.py (agent lookup, CRM call logs)
 depends only on this interface — not on a specific STT/LLM/TTS stack.
 """
 
@@ -64,7 +64,6 @@ class VoicePipelineSession(ABC):
         self._call_log_posted = False
         self._channel_reserved = False
         self._channel_reserved_logged = False
-        self._channel_released = False
         self._call_started_logged = False
         self._call_finalized = False
 

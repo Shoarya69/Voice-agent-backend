@@ -5,7 +5,7 @@ Inbound (by number): single RPC ``get_inbound_agent_bundle``.
 Outbound (by token): Supabase tables + Moontech greeting cold-cache when needed.
 Greeting enrichment: Moontech HTTP only when PCM not cached (write-side synth).
 
-Write paths (call-log, channel release, webhooks) stay on Moontech via lovable_client.
+Write paths (call-log, webhooks) stay on Moontech via lovable_client.
 """
 
 from __future__ import annotations
@@ -381,7 +381,7 @@ async def fetch_agent_payload_by_token(token: str) -> dict[str, Any]:
         )
 
     call_tok_result = await _run_sync(_fetch_call_token)
-    call_tok = call_tok_result.data
+    call_tok = _extract_supabase_data(call_tok_result)
     if call_tok:
         expires_at = call_tok.get("expires_at")
         if expires_at:
@@ -420,7 +420,7 @@ async def fetch_agent_payload_by_token(token: str) -> dict[str, Any]:
     else:
         agent_result = await _run_sync(_fetch_agent_by_voicebot_token)
 
-    agent = agent_result.data
+    agent = _extract_supabase_data(agent_result)
     if not agent:
         raise SupabaseAgentError("agent not found", status_code=404)
     if agent.get("status") and agent.get("status") != "active":
@@ -468,6 +468,32 @@ async def fetch_agent_payload_by_token(token: str) -> dict[str, Any]:
     }
 
 
+async def fetch_greeting_from_moontech(agent_id: str) -> dict[str, Any] | None:
+    """
+    Cold-cache greeting synth via Moontech HTTP only (no ai_agents REST).
+    Returns the greeting object or None — never raises.
+    """
+    try:
+        return await _fetch_greeting_from_moontech(agent_id)
+    except Exception as exc:
+        logger.warning(
+            "Moontech greeting fetch failed agent_id=%s: %s",
+            agent_id[:8] if agent_id else "",
+            exc,
+        )
+        return None
+
+
+def _extract_supabase_data(result: Any) -> dict[str, Any] | None:
+    """Safely read ``.data`` from a Supabase execute() result."""
+    if result is None:
+        return None
+    data = getattr(result, "data", None)
+    if isinstance(data, dict):
+        return data
+    return None
+
+
 async def fetch_agent_payload_with_greeting(agent_id: str) -> dict[str, Any]:
     if not agent_id:
         raise SupabaseAgentError("missing agent_id", status_code=400)
@@ -484,9 +510,26 @@ async def fetch_agent_payload_with_greeting(agent_id: str) -> dict[str, Any]:
         )
 
     agent_result = await _run_sync(_fetch_agent)
-    agent = agent_result.data
+    agent = _extract_supabase_data(agent_result)
     if not agent:
-        raise SupabaseAgentError("agent not found", status_code=404)
+        logger.warning(
+            "ai_agents lookup returned no row for agent_id=%s (RLS or missing)",
+            agent_id[:8],
+        )
+        greeting = await fetch_greeting_from_moontech(agent_id)
+        if not greeting:
+            raise SupabaseAgentError("agent not found", status_code=404)
+        first_message = (greeting.get("text") or "").strip() or "Hello!"
+        enriched = _merge_greeting({"id": agent_id}, greeting)
+        fields = _agent_bundle_fields(enriched)
+        return {
+            "agent_id": agent_id,
+            "user_id": enriched.get("user_id") or "",
+            "token": enriched.get("voicebot_token") or "",
+            **fields,
+            "first_message": first_message,
+            "greeting": _greeting_object(enriched, first_message),
+        }
     if agent.get("status") and agent.get("status") != "active":
         raise SupabaseAgentError("agent inactive", status_code=403)
 

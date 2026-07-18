@@ -226,12 +226,6 @@ LOVABLE_APP_URL = os.getenv("LOVABLE_APP_URL", "")
 # compatibility. The primary auth for agent lookup is the per-agent token
 # passed in the WSS URL query string, handled by app/lovable_client.py.
 LOVABLE_API_SECRET = os.getenv("LOVABLE_API_SECRET", "")
-# MoontechPro channel release (POST on call end). Reservation happens on their
-# voice-inbound hook; this server only releases when the WSS call ends.
-CHANNEL_RELEASE_PATH = os.getenv(
-    "CHANNEL_RELEASE_PATH",
-    "/api/public/voicebot/channel-release",
-)
 
 
 # ---------------------------------------------------------------------------

@@ -17,11 +17,9 @@ Responsibilities, all intentionally kept out of the audio/voice pipeline
                                    to Lovable's voice-status webhook.
   5. post_exotel_conversation(..) - relay Exotel's conversation applet fields
                                    to Lovable's voice-conversation webhook.
-  6. release_channel(...)       - notify MoontechPro to release a reserved
-                                   voice channel when a call ends.
-  7. resolve_agent_bundle(...)  - singleflight agent + greeting resolution
+  6. resolve_agent_bundle(...)  - singleflight agent + greeting resolution
                                    (dedupes concurrent prewarm + WSS prefetch).
-  8. prewarm_agent_bundle(...)  - warm caches during ring / before WSS connect.
+  7. prewarm_agent_bundle(...)  - warm caches during ring / before WSS connect.
 
 All of these use a short-timeout, non-blocking httpx.AsyncClient so a
 Lovable outage or slow response can never stall or crash the voicebot.
@@ -76,8 +74,6 @@ _AGENT_FETCH_RETRY_TIMEOUT = 6.0
 # call-log waits for Lovable to finish DB insert + Gemini analysis (3-8s typical).
 _CALL_LOG_TIMEOUT = 30.0
 _EXOTEL_WEBHOOK_TIMEOUT = 5.0
-_CHANNEL_RELEASE_TIMEOUT = 5.0
-_CHANNEL_RELEASE_RETRY_TIMEOUT = 8.0
 
 _CACHE_TTL_SECONDS = 5 * 60
 
@@ -401,7 +397,7 @@ async def _resolve_agent_bundle_impl(
     token: str | None = None,
     number: str | None = None,
 ) -> AgentConfig:
-    """Fetch agent config + optional pre-stored greeting (two calls max, cached)."""
+    """Fetch agent config + optional pre-stored greeting."""
     started = time.perf_counter()
 
     if token:
@@ -419,6 +415,29 @@ async def _resolve_agent_bundle_impl(
         )
         return base
 
+    # Inbound: RPC already returned the full agent bundle — never re-query ai_agents.
+    # Optionally fetch greeting PCM from Moontech only (cold-cache synth).
+    if number and not token:
+        greeting = await supabase_agent_provider.fetch_greeting_from_moontech(
+            base.agent_id
+        )
+        pcm = _decode_greeting_pcm(greeting or {})
+        if pcm:
+            base.greeting_audio_pcm = pcm
+            logger.info(
+                "LATENCY bundle agent_id=%s greeting=moontech pcm_bytes=%s ms=%.0f",
+                base.agent_id,
+                len(pcm),
+                (time.perf_counter() - started) * 1000,
+            )
+            return base
+        logger.info(
+            "LATENCY bundle agent_id=%s greeting=live_tts ms=%.0f",
+            base.agent_id,
+            (time.perf_counter() - started) * 1000,
+        )
+        return base
+
     try:
         enriched = await fetch_agent_with_greeting(base.agent_id)
         if enriched.greeting_audio_pcm:
@@ -429,7 +448,7 @@ async def _resolve_agent_bundle_impl(
                 (time.perf_counter() - started) * 1000,
             )
             return enriched
-    except LovableClientError as exc:
+    except Exception as exc:
         logger.warning(
             "Bundle greeting fetch failed agent_id=%s: %s",
             base.agent_id,
@@ -674,65 +693,3 @@ async def post_exotel_status(number: str, fields: dict) -> None:
 async def post_exotel_conversation(number: str, fields: dict) -> None:
     """Relay an Exotel conversation applet callback to Lovable."""
     await _post_exotel_webhook(_VOICE_CONVERSATION_PATH, number, fields)
-
-
-async def release_channel(payload: dict) -> bool:
-    """
-    Notify MoontechPro to release a voice channel reserved at call accept time.
-
-    Awaits the HTTP response (with one retry) so cleanup can be confirmed in
-    logs. Never raises — returns True when MoontechPro acknowledges release.
-    """
-    if not config.LOVABLE_APP_URL:
-        logger.warning(
-            "VOICE_CHANNEL event=cleanup_failure call_sid=%s step=channel_release "
-            "error=LOVABLE_APP_URL is not configured",
-            payload.get("call_sid"),
-        )
-        return False
-
-    url = f"{config.LOVABLE_APP_URL.rstrip('/')}{config.CHANNEL_RELEASE_PATH}"
-    headers = {"Content-Type": "application/json"}
-    if config.LOVABLE_API_SECRET:
-        headers["Authorization"] = f"Bearer {config.LOVABLE_API_SECRET}"
-
-    call_sid = payload.get("call_sid")
-    last_error = "unknown error"
-
-    for attempt, timeout in enumerate(
-        (_CHANNEL_RELEASE_TIMEOUT, _CHANNEL_RELEASE_RETRY_TIMEOUT)
-    ):
-        try:
-            client = await _get_client()
-            response = await client.post(
-                url,
-                json=payload,
-                headers=headers,
-                timeout=timeout,
-            )
-            if response.status_code < 400:
-                return True
-
-            last_error = f"HTTP {response.status_code}: {response.text[:200]}"
-            logger.warning(
-                "VOICE_CHANNEL channel release attempt %s/2 failed call_sid=%s status=%s",
-                attempt + 1,
-                call_sid,
-                response.status_code,
-            )
-        except Exception as exc:  # noqa: BLE001 - release must never crash the voicebot
-            last_error = f"{type(exc).__name__}: {exc}"
-            logger.warning(
-                "VOICE_CHANNEL channel release attempt %s/2 failed call_sid=%s error=%s",
-                attempt + 1,
-                call_sid,
-                last_error,
-            )
-
-    logger.error(
-        "VOICE_CHANNEL event=cleanup_failure call_sid=%s step=channel_release error=%s url=%s",
-        call_sid,
-        last_error,
-        url,
-    )
-    return False
