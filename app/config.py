@@ -78,7 +78,7 @@ HTTP_KEEPALIVE_EXPIRY = _get_float("HTTP_KEEPALIVE_EXPIRY", 30.0)
 # ---------------------------------------------------------------------------
 # Voice pipeline provider (switch via .env — no code changes)
 # ---------------------------------------------------------------------------
-# compound         — ElevenLabs STT → OpenAI chat → ElevenLabs TTS (default)
+# compound         — ElevenLabs Realtime STT → OpenAI stream → ElevenLabs WS TTS (default)
 # openai_realtime  — OpenAI Realtime API (speech-to-speech)
 VOICE_PIPELINE = os.getenv("VOICE_PIPELINE", "compound").strip().lower()
 
@@ -160,6 +160,32 @@ _ELEVENLABS_STT_LANGUAGE_DEFAULT = os.getenv("ELEVENLABS_STT_LANGUAGE", "")
 ELEVENLABS_BASE_URL = os.getenv("ELEVENLABS_BASE_URL", "https://api.elevenlabs.io")
 
 # ---------------------------------------------------------------------------
+# Low-latency streaming pipeline (compound production default)
+# ---------------------------------------------------------------------------
+STREAMING_PIPELINE = _get_bool("STREAMING_PIPELINE", True)
+# STT: elevenlabs (Scribe v2 Realtime WS) | deepgram (optional SDK) | batch (rollback)
+STT_PROVIDER = os.getenv("STT_PROVIDER", "elevenlabs").strip().lower()
+# TTS: elevenlabs_ws (persistent stream-input WS) | http (per-clause REST rollback)
+TTS_PROVIDER = os.getenv("TTS_PROVIDER", "elevenlabs_ws").strip().lower()
+STREAMING_STT_MODEL = os.getenv("STREAMING_STT_MODEL", "scribe_v2_realtime")
+STREAMING_STT_VAD_SILENCE_SECS = _get_float("STREAMING_STT_VAD_SILENCE_SECS", 0.45)
+STREAMING_STT_VAD_THRESHOLD = _get_float("STREAMING_STT_VAD_THRESHOLD", 0.4)
+STREAMING_STT_MIN_SPEECH_MS = _get_int("STREAMING_STT_MIN_SPEECH_MS", 100)
+STREAMING_STT_MIN_SILENCE_MS = _get_int("STREAMING_STT_MIN_SILENCE_MS", 100)
+STREAMING_STT_ENDPOINTING_MS = _get_int("STREAMING_STT_ENDPOINTING_MS", 450)
+STREAMING_TTS_WS_INACTIVITY_TIMEOUT = _get_int("STREAMING_TTS_WS_INACTIVITY_TIMEOUT", 180)
+STREAMING_TTS_CHUNK_SCHEDULE = [
+    int(x.strip())
+    for x in os.getenv("STREAMING_TTS_CHUNK_SCHEDULE", "120,160,250,290").split(",")
+    if x.strip().isdigit()
+] or [120, 160, 250, 290]
+STREAMING_CLAUSE_MIN_WORDS = _get_int("STREAMING_CLAUSE_MIN_WORDS", 3)
+STREAMING_CLAUSE_MAX_CHARS = _get_int("STREAMING_CLAUSE_MAX_CHARS", 48)
+TURN_MONITOR_INTERVAL_MS = _get_int("TURN_MONITOR_INTERVAL_MS", 25)
+DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY", "")
+DEEPGRAM_STT_MODEL = os.getenv("DEEPGRAM_STT_MODEL", "nova-3")
+
+# ---------------------------------------------------------------------------
 # Voice / conversation behaviour
 # ---------------------------------------------------------------------------
 # Exotel's voice streaming media format used across this project (raw/slin, 8kHz, 16-bit mono).
@@ -178,7 +204,7 @@ DYNAMIC_RMS_MIN = _get_float("DYNAMIC_RMS_MIN", 400.0)
 NOISE_FLOOR_MAX_RMS = _get_float("NOISE_FLOOR_MAX_RMS", 600.0)
 MIN_VAD_SPEECH_MS = _get_int("MIN_VAD_SPEECH_MS", 250)
 VAD_START_MS = _get_int("VAD_START_MS", 150)
-VAD_END_SILENCE_MS = _get_int("VAD_END_SILENCE_MS", 800)
+VAD_END_SILENCE_MS = _get_int("VAD_END_SILENCE_MS", 450)
 # Tolerate short dips below the speech threshold while a speech candidate is
 # building, instead of discarding the whole candidate (avoids clipping the
 # first syllable of real words on brief energy dips).
@@ -303,9 +329,14 @@ def validate() -> list:
         warnings.append(
             "ELEVENLABS_API_KEY is not set - speech-to-text and text-to-speech will not work."
         )
-    if pipeline == "compound" and not ELEVENLABS_API_KEY:
+    if (
+        pipeline == "compound"
+        and STREAMING_PIPELINE
+        and STT_PROVIDER == "deepgram"
+        and not DEEPGRAM_API_KEY
+    ):
         warnings.append(
-            "ELEVENLABS_API_KEY is not set - speech-to-text and text-to-speech will not work."
+            "STT_PROVIDER=deepgram but DEEPGRAM_API_KEY is not set — streaming STT will fail."
         )
     if not LOVABLE_APP_URL:
         warnings.append("LOVABLE_APP_URL is not set - per-agent token lookup and call-log posting are disabled.")

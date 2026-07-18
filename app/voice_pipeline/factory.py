@@ -30,7 +30,7 @@ def create_voice_pipeline_session(
     """
     Instantiate the configured voice pipeline for a new Exotel WSS connection.
 
-    Default: ``compound`` (ElevenLabs STT → OpenAI → ElevenLabs TTS).
+    Default: ``compound`` (ElevenLabs Realtime STT → OpenAI stream → ElevenLabs WS TTS).
     """
     pipeline = get_pipeline_name()
     if pipeline not in _REGISTERED_PIPELINES:

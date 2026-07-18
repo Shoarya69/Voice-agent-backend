@@ -26,6 +26,7 @@ from app.audio_utils import (
 from app.elevenlabs_service import ElevenLabsError, STTResult, elevenlabs_service
 from app.openai_service import BrainError, openai_brain
 from app.runtime import stt_semaphore, tts_semaphore, vad_executor
+from app.streaming.session_controller import StreamingSessionController
 from app.turn_timeline import TurnTimeline
 from app.voice_pipeline.base import VoicePipelineSession
 
@@ -141,6 +142,8 @@ class VoiceSession(VoicePipelineSession):
         self._should_end_call = False
         bytes_per_ms = config.SAMPLE_RATE * config.SAMPLE_WIDTH * config.CHANNELS / 1000
         self._max_turn_pcm_bytes = int(config.MAX_TURN_AUDIO_MS * bytes_per_ms)
+        self._streaming = StreamingSessionController(self)
+        self._pace_next_send_time: float | None = None
 
     # ------------------------------------------------------------------
     # Inbound audio handling
@@ -174,6 +177,11 @@ class VoiceSession(VoicePipelineSession):
 
         loop = asyncio.get_running_loop()
         now = loop.time()
+
+        if self._streaming.enabled:
+            await self._handle_streaming_audio(pcm, frames, now)
+            return
+
         if not config.ENABLE_BARGE_IN and (
             self.is_speaking or self._is_playing_welcome or now < self._echo_guard_until
         ):
@@ -333,14 +341,57 @@ class VoiceSession(VoicePipelineSession):
             config.ECHO_GUARD_MS / 1000
         )
 
+    async def _handle_streaming_audio(
+        self, pcm: bytes, frames: list[bytes], now: float
+    ) -> None:
+        if not config.ENABLE_BARGE_IN and (
+            self.is_speaking or self._is_playing_welcome or now < self._echo_guard_until
+        ):
+            return
+
+        if config.ENABLE_BARGE_IN and (
+            self.is_speaking
+            or self._is_playing_welcome
+            or (self._response_task and not self._response_task.done())
+        ):
+            loop = asyncio.get_running_loop()
+            decisions, nf, max_rms, cal_ms = await loop.run_in_executor(
+                vad_executor,
+                _compute_vad_decisions,
+                self._vad,
+                frames,
+                self._noise_floor_rms,
+                self._max_rms_seen,
+                self._noise_calibration_ms,
+            )
+            self._noise_floor_rms = nf
+            self._max_rms_seen = max_rms
+            self._noise_calibration_ms = cal_ms
+            for frame, decision in zip(frames, decisions):
+                if decision.accepted_as_speech:
+                    self._interrupt_response()
+                    break
+            if self.is_speaking or (
+                self._response_task and not self._response_task.done()
+            ):
+                await self._streaming.forward_audio(pcm)
+                return
+
+        if now < self._echo_guard_until:
+            return
+
+        await self._streaming.forward_audio(pcm)
+
     def _ensure_turn_monitor(self):
+        if self._streaming.enabled:
+            return
         if self._turn_monitor_task is None or self._turn_monitor_task.done():
             self._turn_monitor_task = asyncio.create_task(self._monitor_turn_silence())
 
     async def _monitor_turn_silence(self):
         try:
             while not self._closed:
-                await asyncio.sleep(0.1)
+                await asyncio.sleep(config.TURN_MONITOR_INTERVAL_MS / 1000)
                 if (
                     self._speech_started
                     and self._last_voice_at is not None
@@ -737,6 +788,29 @@ class VoiceSession(VoicePipelineSession):
         finally:
             await frame_queue.put(None)
 
+    async def _send_paced_frame(
+        self,
+        frame: bytes,
+        timeline: TurnTimeline | None = None,
+        playback_started: bool = False,
+    ) -> bool:
+        if self._closed or not self._websocket_is_open():
+            return False
+        loop = asyncio.get_running_loop()
+        now = loop.time()
+        if self._pace_next_send_time is None:
+            self._pace_next_send_time = now
+        delay = self._pace_next_send_time - now
+        if delay > 0:
+            await asyncio.sleep(delay)
+        if not await self._send_pcm_frame(frame):
+            return False
+        if timeline is not None:
+            timeline.mark_once("first_packet_sent_ms")
+            timeline.mark("last_packet_sent_ms")
+        self._pace_next_send_time += config.CHUNK_DURATION_MS / 1000
+        return True
+
     async def _pace_and_send_frames(
         self, frame_queue: asyncio.Queue, timeline: TurnTimeline | None = None
     ) -> dict:
@@ -750,9 +824,8 @@ class VoiceSession(VoicePipelineSession):
         """
         stats = {"total_ms": 0}
         started = time.perf_counter()
-        loop = asyncio.get_running_loop()
-        next_send_time: float | None = None
         self.is_speaking = True
+        self._pace_next_send_time = None
         playback_started = False
         try:
             while True:
@@ -765,22 +838,13 @@ class VoiceSession(VoicePipelineSession):
                     timeline.record_playback_queue_gap(gap_ms)
                 if frame is None:
                     break
-                now = loop.time()
-                if next_send_time is None:
-                    next_send_time = now
-                delay = next_send_time - now
-                if delay > 0:
-                    await asyncio.sleep(delay)
-                if not await self._send_pcm_frame(frame):
+                if not await self._send_paced_frame(frame, timeline, playback_started):
                     break
-                if timeline is not None:
-                    timeline.mark_once("first_packet_sent_ms")
-                    timeline.mark("last_packet_sent_ms")
                 playback_started = True
-                next_send_time += config.CHUNK_DURATION_MS / 1000
         finally:
             self.is_speaking = False
             self._arm_echo_guard()
+            self._pace_next_send_time = None
             stats["total_ms"] = round((time.perf_counter() - started) * 1000)
         return stats
 
@@ -801,6 +865,8 @@ class VoiceSession(VoicePipelineSession):
                     await frame_queue.put(frame)
                 await frame_queue.put(None)
                 await self._pace_and_send_frames(frame_queue)
+            elif self._streaming.enabled:
+                await self._streaming.speak_text(config.WELCOME_MESSAGE)
             else:
                 sentence_queue: asyncio.Queue = asyncio.Queue()
                 await sentence_queue.put(config.WELCOME_MESSAGE)
@@ -870,6 +936,7 @@ class VoiceSession(VoicePipelineSession):
         task = self._response_task
         if task is None or task.done():
             return
+        self._streaming.cancel_active_turn()
         task.cancel()
         try:
             await task
@@ -960,6 +1027,7 @@ class VoiceSession(VoicePipelineSession):
 
     async def close(self):
         self._closed = True
+        await self._streaming.close()
         prefetch = getattr(self, "_agent_prefetch_task", None)
         if prefetch is not None and not prefetch.done():
             prefetch.cancel()

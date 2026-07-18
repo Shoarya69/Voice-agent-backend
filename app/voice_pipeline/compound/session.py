@@ -1,7 +1,7 @@
 """
 Compound pipeline — production default.
 
-Exotel → ElevenLabs STT → OpenAI (chat) → ElevenLabs TTS → Exotel
+Exotel → ElevenLabs Realtime STT (WS) → OpenAI (stream) → ElevenLabs TTS (WS) → Exotel
 
 Implementation lives in ``app.voice_session.VoiceSession``; this module is the
 registered provider alias so the factory can select it without coupling callers

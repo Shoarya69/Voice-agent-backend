@@ -16,7 +16,7 @@ Exotel WSS (ai_server.py)
 create_voice_pipeline_session()  ← reads VOICE_PIPELINE
         │
         ├── compound ──► CompoundPipelineSession ──► VoiceSession
-        │                  (ElevenLabs STT → OpenAI chat → ElevenLabs TTS)
+        │                  (ElevenLabs Realtime STT WS → OpenAI stream → ElevenLabs TTS WS)
         │
         └── openai_realtime ──► OpenAIRealtimePipelineSession
                                (OpenAI Realtime WebSocket, speech-to-speech)
