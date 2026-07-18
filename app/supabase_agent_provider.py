@@ -1,10 +1,9 @@
 """
 Direct Supabase reads for agent config (replaces Moontech HTTP GET endpoints).
 
-Mirrors the Moontech routes:
-  - agent-by-number
-  - agent-by-token
-  - agent-with-greeting (DB read; Moontech HTTP only for cold greeting synth)
+Inbound (by number): single RPC ``get_inbound_agent_bundle``.
+Outbound (by token): Supabase tables + Moontech greeting cold-cache when needed.
+Greeting enrichment: Moontech HTTP only when PCM not cached (write-side synth).
 
 Write paths (call-log, channel release, webhooks) stay on Moontech via lovable_client.
 """
@@ -31,10 +30,7 @@ AGENT_COLS = (
     "greeting_audio_hash, greeting_audio_generated_at"
 )
 
-_PHONE_NUMBER_COLS = (
-    "id, user_id, number, default_inbound_agent_id, agent_id, fallback_agent_id, "
-    "inbound_enabled"
-)
+_INBOUND_AGENT_RPC = "get_inbound_agent_bundle"
 
 _DEFAULT_VOICE_ID = "cgSgspJ2msm6clMCkdW9"
 _DEFAULT_SYSTEM_PROMPT = "You are a helpful voice assistant."
@@ -274,84 +270,96 @@ def _merge_greeting(agent: dict[str, Any], greeting: dict[str, Any]) -> dict[str
     return merged
 
 
+def _payload_from_inbound_rpc_row(row: dict[str, Any]) -> dict[str, Any]:
+    """Map ``get_inbound_agent_bundle`` RPC row to lovable_client payload shape."""
+    first_message = (row.get("first_message") or "").strip()
+    if not first_message:
+        name = row.get("assistant_name") or "AI Voice Assistant"
+        business = row.get("business_name") or "our team"
+        first_message = (
+            f"Hello! This is {name} from {business}. How can I help you today?"
+        )
+
+    greeting_source = {
+        "greeting_audio_base64": row.get("greeting_audio_base64"),
+        "greeting_audio_mime": row.get("greeting_audio_mime"),
+        "greeting_audio_bytes": row.get("greeting_audio_bytes"),
+        "greeting_audio_url": row.get("greeting_audio_url"),
+        "greeting_audio_hash": row.get("greeting_audio_hash"),
+        "greeting_audio_generated_at": row.get("greeting_audio_generated_at"),
+    }
+
+    return {
+        "phone_number_id": row.get("phone_number_id"),
+        "number": row.get("number"),
+        "voicebot_token": row.get("voicebot_token"),
+        "token": row.get("voicebot_token") or "",
+        "agent_id": row["agent_id"],
+        "user_id": row.get("user_id"),
+        "system_prompt": row.get("system_prompt") or _DEFAULT_SYSTEM_PROMPT,
+        "voice_id": row.get("voice_id") or _DEFAULT_VOICE_ID,
+        "first_message": first_message,
+        "closing_message": row.get("closing_message"),
+        "language": normalize_language(row.get("language")),
+        "temperature": 0.7,
+        "max_tokens": 512,
+        "speed": row.get("speed") if isinstance(row.get("speed"), (int, float)) else 1.0,
+        "tone": row.get("tone") or "professional",
+        "greeting": _greeting_object(greeting_source, first_message),
+    }
+
+
 async def fetch_agent_payload_by_number(number: str) -> dict[str, Any]:
-    e164 = normalize_phone(number)
-    if not e164:
+    """
+    Resolve inbound agent bundle via Supabase RPC (single source of truth).
+
+    Replaces legacy REST lookups to phone_numbers / ai_agents and Moontech HTTP
+    ``/agent-by-number``.
+    """
+    raw = (number or "").strip()
+    if not raw:
         raise SupabaseAgentError("invalid number", status_code=400)
 
     client = await _get_supabase()
-    last10 = re.sub(r"\D", "", e164)[-10:]
 
-    def _query():
-        return (
-            client.table("phone_numbers")
-            .select(_PHONE_NUMBER_COLS)
-            .or_(f"number.eq.{e164},number.ilike.%{last10}")
-            .limit(1)
-            .execute()
+    def _rpc_call():
+        return client.rpc(
+            _INBOUND_AGENT_RPC,
+            {"phone_number": raw},
+        ).execute()
+
+    try:
+        result = await _run_sync(_rpc_call)
+    except SupabaseAgentError:
+        raise
+    except Exception as exc:
+        logger.exception(
+            "get_inbound_agent_bundle RPC failed number=...%s",
+            raw[-4:] if len(raw) >= 4 else raw,
         )
+        raise SupabaseAgentError(f"inbound agent lookup failed: {exc}") from exc
 
-    result = await _run_sync(_query)
-    pn_list = result.data or []
-    pn = pn_list[0] if pn_list else None
-    if not pn:
-        raise SupabaseAgentError(f"number_not_found: {e164}", status_code=404)
-    if pn.get("inbound_enabled") is False:
-        raise SupabaseAgentError("inbound_disabled", status_code=403)
+    data = result.data
+    row: dict[str, Any] | None = None
+    if isinstance(data, list):
+        row = data[0] if data else None
+    elif isinstance(data, dict):
+        row = data
 
-    agent_id = (
-        pn.get("default_inbound_agent_id")
-        or pn.get("agent_id")
-        or pn.get("fallback_agent_id")
+    if not row:
+        logger.info(
+            "number_not_found number=...%s raw=%r",
+            raw[-4:] if len(raw) >= 4 else raw,
+            raw,
+        )
+        raise SupabaseAgentError("number_not_found", status_code=404)
+
+    logger.info(
+        "get_inbound_agent_bundle ok number=...%s agent_id=%s",
+        raw[-4:] if len(raw) >= 4 else raw,
+        row.get("agent_id"),
     )
-    user_id = pn.get("user_id")
-
-    def _fetch_agent_by_id(aid: str):
-        return (
-            client.table("ai_agents")
-            .select(AGENT_COLS)
-            .eq("id", aid)
-            .eq("user_id", user_id)
-            .eq("status", "active")
-            .maybe_single()
-            .execute()
-        )
-
-    def _fetch_latest_agent():
-        return (
-            client.table("ai_agents")
-            .select(AGENT_COLS)
-            .eq("user_id", user_id)
-            .eq("status", "active")
-            .order("created_at", desc=True)
-            .limit(1)
-            .maybe_single()
-            .execute()
-        )
-
-    agent = None
-    if agent_id:
-        agent_result = await _run_sync(_fetch_agent_by_id, agent_id)
-        agent = agent_result.data
-
-    if not agent:
-        latest_result = await _run_sync(_fetch_latest_agent)
-        agent = latest_result.data
-
-    if not agent:
-        raise SupabaseAgentError("no_agent_configured", status_code=404)
-
-    fields = _agent_bundle_fields(agent)
-    return {
-        "phone_number_id": pn.get("id"),
-        "number": pn.get("number"),
-        "voicebot_token": agent.get("voicebot_token"),
-        "token": agent.get("voicebot_token") or "",
-        "agent_id": agent["id"],
-        "user_id": agent.get("user_id") or user_id,
-        **fields,
-        "greeting": _greeting_object(agent, fields["first_message"]),
-    }
+    return _payload_from_inbound_rpc_row(row)
 
 
 async def fetch_agent_payload_by_token(token: str) -> dict[str, Any]:

@@ -29,11 +29,10 @@ Nothing here ever sends an `agent_id` - Lovable always resolves the agent
 itself, either from the token (agent-by-token) or from the caller's phone
 number via `phone_numbers` (voice-inbound, Exotel -> Lovable directly).
 
-Agent-config lookups (read path — Supabase when configured, else legacy HTTP):
-  - Direct Supabase: phone_numbers, ai_agents, voicebot_call_tokens
-  - Legacy HTTP fallback (deprecated): GET /api/public/voicebot/agent-by-token
-  - Legacy HTTP fallback (deprecated): GET /api/public/voicebot/agent-by-number/{mobile_number}
-  - Moontech HTTP (cold greeting synth only): GET /api/public/voicebot/agent-with-greeting/{agentId}
+Agent-config lookups (read path):
+  - Inbound by number: Supabase RPC ``get_inbound_agent_bundle`` (single path)
+  - Outbound by token: Supabase tables (+ Moontech greeting cold-cache when needed)
+  - Greeting PCM: Moontech HTTP ``agent-with-greeting`` when not cached
 
 The `voice-inbound` telephony hook (Exotel -> Lovable, TwiML) is separate
 and is not called from this service.
@@ -56,7 +55,6 @@ from app import supabase_agent_provider
 logger = logging.getLogger(__name__)
 
 _AGENT_LOOKUP_PATH = "/api/public/voicebot/agent-by-token"
-_AGENT_BY_NUMBER_PATH = "/api/public/voicebot/agent-by-number"
 _AGENT_WITH_GREETING_PATH = "/api/public/voicebot/agent-with-greeting"
 _CALL_LOG_PATH = "/api/public/voicebot/call-log"
 
@@ -337,14 +335,15 @@ async def fetch_agent(token: str) -> AgentConfig:
 
 async def fetch_agent_by_number(number: str) -> AgentConfig:
     """
-    Resolve agent config for a caller mobile number via
-    GET /api/public/voicebot/agent-by-number/{mobile_number}.
-    Same AgentConfig shape as fetch_agent(). Cached per number for 5 minutes.
+    Resolve inbound agent config via Supabase RPC ``get_inbound_agent_bundle``.
+    Cached per number for 5 minutes.
     """
     if not number:
         raise LovableClientError("missing mobile number")
-    if not supabase_agent_provider.is_configured() and not config.LOVABLE_APP_URL:
-        raise LovableClientError("LOVABLE_APP_URL is not configured")
+    if not supabase_agent_provider.is_configured():
+        raise LovableClientError(
+            "Supabase not configured — inbound calls require get_inbound_agent_bundle RPC"
+        )
 
     cached = _agent_by_number_cache.get(number)
     if cached is not None and (time.monotonic() - cached[0]) < _CACHE_TTL_SECONDS:
@@ -546,26 +545,16 @@ async def _fetch_agent_from_lovable(token: str) -> AgentConfig:
 
 
 async def _fetch_agent_by_number_from_lovable(number: str) -> AgentConfig:
-    payload = await _fetch_agent_payload_via_supabase(
-        lambda: supabase_agent_provider.fetch_agent_payload_by_number(number),
-        log_label="agent-by-number",
-    )
-    if payload is not None:
-        return _parse_agent_config_payload(payload)
-
-    encoded = quote(number, safe="")
-    url = f"{config.LOVABLE_APP_URL.rstrip('/')}{_AGENT_BY_NUMBER_PATH}/{encoded}"
+    """Inbound agent resolution — Supabase RPC only (no REST / Moontech HTTP)."""
     try:
-        payload = await _get_json_with_retry(
-            url,
-            params=None,
-            log_key=f"number={_number_suffix(number)}",
-            headers=_auth_headers(),
-        )
+        payload = await supabase_agent_provider.fetch_agent_payload_by_number(number)
+    except supabase_agent_provider.SupabaseAgentError as exc:
+        raise LovableClientError(str(exc)) from exc
+    try:
         return _parse_agent_config_payload(payload)
     except (KeyError, TypeError, ValueError) as exc:
         logger.error(
-            "Lovable agent-by-number returned a malformed payload number=%s error=%s",
+            "Inbound RPC bundle malformed for number=...%s error=%s",
             _number_suffix(number),
             exc,
         )
