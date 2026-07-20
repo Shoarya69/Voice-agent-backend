@@ -11,6 +11,12 @@ from typing import TYPE_CHECKING
 
 from app import config
 from app.elevenlabs_service import STTResult
+from app.latency_trace import (
+    CallLatencySummary,
+    TurnLatencyTrace,
+    active_trace,
+    set_active_trace,
+)
 from app.runtime import stt_semaphore
 from app.streaming.factory import StreamingProviders, build_streaming_providers
 from app.streaming.providers.base import STTEventKind
@@ -120,6 +126,9 @@ class StreamingSessionController:
         try:
             async for event in self._providers.stt.events():
                 if event.kind == STTEventKind.PARTIAL:
+                    trace = active_trace()
+                    if trace is not None:
+                        trace.record_stt_partial()
                     logger.debug(
                         "STT partial conn=%s text=%r",
                         self._session.connection_id,
@@ -190,6 +199,13 @@ class StreamingSessionController:
         session = self._session
         self._turn_in_progress = True
         timeline = TurnTimeline(connection_id=session.connection_id)
+        turn_index = len(session._latency_summary.turns) + 1
+        trace = TurnLatencyTrace(
+            connection_id=session.connection_id,
+            turn_index=turn_index,
+        )
+        trace.mark_stt_committed(user_text)
+        trace_token = set_active_trace(trace)
         timeline.mark("stt_start_ms")
         timeline.mark("stt_complete_ms")
         timeline.stt_ms = 0.0
@@ -217,6 +233,9 @@ class StreamingSessionController:
 
             if not reply_text:
                 timeline.emit()
+                if config.ENABLE_LATENCY_TRACE:
+                    trace.emit_turn_summary()
+                    session._latency_summary.add_turn(trace)
                 return
 
             logger.info("🧠 Assistant (%s) reply: %s", session.connection_id, reply_text)
@@ -236,6 +255,9 @@ class StreamingSessionController:
                 turn_total_ms,
             )
             timeline.emit()
+            if config.ENABLE_LATENCY_TRACE:
+                trace.emit_turn_summary()
+                session._latency_summary.add_turn(trace)
 
             if session._should_end_call:
                 logger.info(
@@ -250,6 +272,7 @@ class StreamingSessionController:
             )
             raise
         finally:
+            set_active_trace(trace_token)
             session.is_speaking = False
             session._arm_echo_guard()
             self._turn_in_progress = False

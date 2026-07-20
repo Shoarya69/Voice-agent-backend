@@ -25,6 +25,7 @@ from app.audio_utils import (
 )
 from app.elevenlabs_service import ElevenLabsError, STTResult, elevenlabs_service
 from app.openai_service import BrainError, openai_brain
+from app.latency_trace import CallLatencySummary
 from app.runtime import stt_semaphore, tts_semaphore, vad_executor
 from app.streaming.session_controller import StreamingSessionController
 from app.turn_timeline import TurnTimeline
@@ -144,6 +145,7 @@ class VoiceSession(VoicePipelineSession):
         self._max_turn_pcm_bytes = int(config.MAX_TURN_AUDIO_MS * bytes_per_ms)
         self._streaming = StreamingSessionController(self)
         self._pace_next_send_time: float | None = None
+        self._latency_summary = CallLatencySummary(connection_id)
 
     # ------------------------------------------------------------------
     # Inbound audio handling
@@ -801,10 +803,23 @@ class VoiceSession(VoicePipelineSession):
         if self._pace_next_send_time is None:
             self._pace_next_send_time = now
         delay = self._pace_next_send_time - now
+        pace_delay_ms = max(0.0, delay * 1000)
         if delay > 0:
             await asyncio.sleep(delay)
+        send_started = time.perf_counter()
         if not await self._send_pcm_frame(frame):
             return False
+        send_latency_ms = (time.perf_counter() - send_started) * 1000
+        from app import config as app_config
+        from app.latency_trace import active_trace
+
+        if app_config.ENABLE_LATENCY_TRACE:
+            trace = active_trace()
+            if trace is not None:
+                trace.record_exotel_send(
+                    pace_delay_ms=pace_delay_ms,
+                    send_latency_ms=send_latency_ms,
+                )
         if timeline is not None:
             timeline.mark_once("first_packet_sent_ms")
             timeline.mark("last_packet_sent_ms")
@@ -1028,6 +1043,8 @@ class VoiceSession(VoicePipelineSession):
     async def close(self):
         self._closed = True
         await self._streaming.close()
+        if config.ENABLE_LATENCY_TRACE:
+            self._latency_summary.emit_call_summary()
         prefetch = getattr(self, "_agent_prefetch_task", None)
         if prefetch is not None and not prefetch.done():
             prefetch.cancel()

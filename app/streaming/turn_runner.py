@@ -13,6 +13,7 @@ import websockets.exceptions
 
 from app import config
 from app.audio_utils import chunk_pcm
+from app.latency_trace import active_trace
 from app.runtime import tts_semaphore
 from app.streaming.clause_buffer import split_next_clause
 from app.streaming.factory import StreamingProviders
@@ -82,6 +83,9 @@ class StreamingTurnRunner:
                         openai_started = True
                         timeline.mark_once("openai_request_ms")
                     timeline.mark_once("openai_first_token_ms")
+                    trace = active_trace()
+                    if trace is not None:
+                        trace.record_llm_token()
 
                     if words_sent >= config.REPLY_WORD_MAX:
                         break
@@ -106,6 +110,9 @@ class StreamingTurnRunner:
                             )
                             timeline.mark_once("llm_first_sentence_ms")
                         timeline.mark_once("tts_first_request_ms")
+                        trace = active_trace()
+                        if trace is not None:
+                            trace.record_llm_clause(clause)
                         await self._providers.tts.send_text(clause)
                         stats.clauses += 1
                         if words_sent >= config.REPLY_WORD_MAX:
@@ -122,6 +129,9 @@ class StreamingTurnRunner:
                             )
                             timeline.mark_once("llm_first_sentence_ms")
                         timeline.mark_once("tts_first_request_ms")
+                        trace = active_trace()
+                        if trace is not None:
+                            trace.record_llm_clause(tail)
                         await self._providers.tts.send_text(tail)
                         stats.clauses += 1
 
@@ -169,6 +179,9 @@ class StreamingTurnRunner:
                     )
                     timeline.mark_once("tts_first_byte_ms")
                 residual.extend(raw_chunk)
+                trace = active_trace()
+                if trace is not None:
+                    trace.record_pcm_residual(len(residual))
                 while len(residual) >= config.BYTES_PER_CHUNK:
                     frame = bytes(residual[: config.BYTES_PER_CHUNK])
                     del residual[: config.BYTES_PER_CHUNK]
@@ -176,6 +189,13 @@ class StreamingTurnRunner:
                         return
                     playback_started = True
             if residual:
+                unpadded_len = len(bytes(residual))
+                trace = active_trace()
+                if (
+                    trace is not None
+                    and unpadded_len % config.BYTES_PER_CHUNK != 0
+                ):
+                    trace.record_pcm_silence_pad()
                 for frame in chunk_pcm(bytes(residual)):
                     if not await self._send_frame(frame, timeline, playback_started):
                         return

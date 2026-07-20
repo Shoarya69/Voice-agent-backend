@@ -224,6 +224,8 @@ MAX_CONVERSATION_TURNS = _get_int("MAX_CONVERSATION_TURNS", 20)
 # Let the caller interrupt the bot mid-sentence by speaking. Disable this if your
 # telephony line echoes the bot's own voice back (causing false interruptions).
 ENABLE_BARGE_IN = _get_bool("ENABLE_BARGE_IN", False)
+# Detailed per-stage latency logs (LATENCY_TURN / LATENCY_CALL); logging only.
+ENABLE_LATENCY_TRACE = _get_bool("ENABLE_LATENCY_TRACE", True)
 
 # How many bytes of raw PCM correspond to one Exotel media chunk (20ms @ 8kHz/16-bit/mono = 320 bytes)
 CHUNK_DURATION_MS = 20

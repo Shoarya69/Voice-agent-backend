@@ -11,6 +11,7 @@ import asyncio
 import base64
 import json
 import logging
+import time
 from typing import AsyncIterator
 from urllib.parse import urlencode
 
@@ -36,6 +37,7 @@ class ElevenLabsWebSocketTTSProvider(StreamingTTSProvider):
         self._utterance_open = False
         self._utterance_done = asyncio.Event()
         self._utterance_audio: asyncio.Queue[bytes | None] = asyncio.Queue()
+        self._flush_sent = False
 
     def _build_uri(self) -> str:
         base = config.ELEVENLABS_BASE_URL.rstrip("/").replace("https://", "wss://")
@@ -108,6 +110,7 @@ class ElevenLabsWebSocketTTSProvider(StreamingTTSProvider):
             except asyncio.QueueEmpty:
                 break
         self._utterance_done.clear()
+        self._flush_sent = False
         if not self._connected or self._ws is None:
             await self._open_socket()
             self._reconnects += 1
@@ -121,22 +124,32 @@ class ElevenLabsWebSocketTTSProvider(StreamingTTSProvider):
             await self.begin_utterance()
         if not chunk.endswith(" "):
             chunk = f"{chunk} "
+        started = time.perf_counter()
+        label = chunk.strip()[:40]
         try:
             assert self._ws is not None
             await self._ws.send(json.dumps({"text": chunk}))
         except websockets.exceptions.ConnectionClosed:
             await self._recover_and_send(chunk)
+            started = time.perf_counter()
+        finally:
+            from app.latency_trace import active_trace
+
+            trace = active_trace()
+            if trace is not None:
+                trace.record_tts_ws_send(label, (time.perf_counter() - started) * 1000)
 
     async def flush_utterance(self) -> None:
         if self._closed or not self._utterance_open or self._ws is None:
             self._utterance_open = False
             self._utterance_done.set()
             return
+        self._utterance_open = False
+        self._flush_sent = True
         try:
             await self._ws.send(json.dumps({"text": ""}))
         except websockets.exceptions.ConnectionClosed:
             self._connected = False
-        self._utterance_open = False
         try:
             await asyncio.wait_for(self._utterance_done.wait(), timeout=30.0)
         except asyncio.TimeoutError:
@@ -144,17 +157,34 @@ class ElevenLabsWebSocketTTSProvider(StreamingTTSProvider):
                 "TTS utterance flush timed out conn=%s",
                 self._connection_id,
             )
+        finally:
+            from app.latency_trace import active_trace
+
+            trace = active_trace()
+            if trace is not None:
+                trace.mark_tts_flush()
+            self._flush_sent = False
 
     async def iter_utterance_audio(self) -> AsyncIterator[bytes]:
+        from app.latency_trace import active_trace
+
         while True:
+            wait_started = time.perf_counter()
             try:
                 chunk = await asyncio.wait_for(self._utterance_audio.get(), timeout=0.25)
             except asyncio.TimeoutError:
+                wait_ms = (time.perf_counter() - wait_started) * 1000
+                trace = active_trace()
+                if trace is not None:
+                    trace.record_pcm_underflow(wait_ms)
                 if self._utterance_done.is_set() and self._utterance_audio.empty():
                     break
                 continue
             if chunk is None:
                 break
+            trace = active_trace()
+            if trace is not None:
+                trace.record_tts_chunk(len(chunk))
             yield chunk
 
     async def audio_chunks(self) -> AsyncIterator[bytes]:
@@ -214,7 +244,18 @@ class ElevenLabsWebSocketTTSProvider(StreamingTTSProvider):
                     pcm = base64.b64decode(audio_b64)
                     await self._utterance_audio.put(pcm)
                 if data.get("isFinal"):
-                    self._utterance_done.set()
+                    from app.latency_trace import active_trace
+
+                    if self._flush_sent:
+                        self._utterance_done.set()
+                    else:
+                        trace = active_trace()
+                        if trace is not None:
+                            trace.record_tts_premature_is_final()
+                        logger.debug(
+                            "TTS isFinal between clauses (ignored) conn=%s",
+                            self._connection_id,
+                        )
         except asyncio.CancelledError:
             raise
         except websockets.exceptions.ConnectionClosed:
