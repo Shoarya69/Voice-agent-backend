@@ -358,19 +358,16 @@ class VoiceSession(VoicePipelineSession):
     async def _handle_streaming_audio(
         self, pcm: bytes, frames: list[bytes], now: float
     ) -> None:
-        # While the bot speaks the greeting, ignore inbound audio (telephony echo).
-        # Keep this window short — oversized greeting PCM blocks the caller for 20s+.
-        if self._is_playing_welcome:
-            return
+        # Feed STT whenever outside the short post-playback echo guard.
+        # Keeps the Scribe websocket alive during long greeting TTS (~20s).
+        if now >= self._echo_guard_until:
+            await self._streaming.forward_audio(pcm)
 
-        if not config.ENABLE_BARGE_IN and (
-            self.is_speaking or now < self._echo_guard_until
-        ):
+        if self._is_playing_welcome:
             return
 
         if config.ENABLE_BARGE_IN and (
             self.is_speaking
-            or self._is_playing_welcome
             or (self._response_task and not self._response_task.done())
         ):
             loop = asyncio.get_running_loop()
@@ -390,16 +387,13 @@ class VoiceSession(VoicePipelineSession):
                 if decision.accepted_as_speech:
                     self._interrupt_response()
                     break
-            if self.is_speaking or (
-                self._response_task and not self._response_task.done()
-            ):
-                await self._streaming.forward_audio(pcm)
-                return
+            return
+
+        if not config.ENABLE_BARGE_IN and self.is_speaking:
+            return
 
         if now < self._echo_guard_until:
             return
-
-        await self._streaming.forward_audio(pcm)
 
     def _ensure_turn_monitor(self):
         if self._streaming.enabled:
@@ -883,12 +877,27 @@ class VoiceSession(VoicePipelineSession):
     async def speak_welcome(self):
         if not config.ENABLE_WELCOME_MESSAGE or not config.WELCOME_MESSAGE:
             return
-        self.history.append({"role": "assistant", "content": config.WELCOME_MESSAGE})
+        welcome = self._welcome_text()
+        self.history.append({"role": "assistant", "content": welcome})
         self._set_response_task(self._speak_welcome())
+
+    @staticmethod
+    def _welcome_text() -> str:
+        words = (config.WELCOME_MESSAGE or "").split()
+        if len(words) <= config.MAX_WELCOME_WORDS:
+            return config.WELCOME_MESSAGE
+        trimmed = " ".join(words[: config.MAX_WELCOME_WORDS]).strip()
+        logger.info(
+            "Welcome message trimmed to %s words (max=%s)",
+            config.MAX_WELCOME_WORDS,
+            config.MAX_WELCOME_WORDS,
+        )
+        return trimmed
 
     async def _speak_welcome(self):
         """Play the greeting without letting initial stream noise cancel it."""
         self._is_playing_welcome = True
+        welcome = self._welcome_text()
         try:
             greeting_pcm = getattr(self, "greeting_audio_pcm", None)
             if greeting_pcm:
@@ -905,10 +914,16 @@ class VoiceSession(VoicePipelineSession):
                 await frame_queue.put(None)
                 await self._pace_and_send_frames(frame_queue)
             elif self._streaming.enabled:
-                await self._streaming.speak_text(config.WELCOME_MESSAGE)
+                logger.info(
+                    "🎙️ Live TTS greeting for %s words=%s text=%r",
+                    self.connection_id,
+                    len(welcome.split()),
+                    welcome[:80],
+                )
+                await self._streaming.speak_text(welcome)
             else:
                 sentence_queue: asyncio.Queue = asyncio.Queue()
-                await sentence_queue.put(config.WELCOME_MESSAGE)
+                await sentence_queue.put(welcome)
                 await sentence_queue.put(None)
                 await self._speak_from_sentence_queue(sentence_queue)
         except asyncio.CancelledError:
@@ -921,6 +936,8 @@ class VoiceSession(VoicePipelineSession):
         finally:
             self._is_playing_welcome = False
             self._arm_echo_guard()
+            if self._streaming.enabled:
+                await self._streaming.refresh_stt_after_playback()
 
     def _log_response_task_result(self, task: asyncio.Task, label: str) -> None:
         if task.cancelled():

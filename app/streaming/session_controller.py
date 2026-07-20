@@ -68,7 +68,41 @@ class StreamingSessionController:
             return
         await self.ensure_connected()
         assert self._providers is not None
-        await self._providers.stt.send_audio(pcm)
+        await self._ensure_stt_listener()
+        stt = self._providers.stt
+        if hasattr(stt, "ensure_live"):
+            await stt.ensure_live()
+        await stt.send_audio(pcm)
+
+    async def _ensure_stt_listener(self) -> None:
+        """Restart STT event consumer if it exited after a websocket drop."""
+        if self._stt_task is None or self._stt_task.done():
+            if self._stt_task is not None and not self._stt_task.cancelled():
+                exc = self._stt_task.exception()
+                if exc is not None:
+                    logger.error(
+                        "STT event loop ended conn=%s error=%s — restarting",
+                        self._session.connection_id,
+                        exc,
+                    )
+            logger.warning(
+                "Restarting STT event loop conn=%s",
+                self._session.connection_id,
+            )
+            self._stt_task = asyncio.create_task(self._stt_event_loop())
+
+    async def refresh_stt_after_playback(self) -> None:
+        """Call after bot TTS so STT is live before the caller speaks."""
+        if not self.enabled or self._providers is None:
+            return
+        stt = self._providers.stt
+        if hasattr(stt, "ensure_live"):
+            await stt.ensure_live()
+        await self._ensure_stt_listener()
+        logger.info(
+            "STT refreshed after playback conn=%s",
+            self._session.connection_id,
+        )
 
     async def close(self) -> None:
         if self._stt_task is not None:
@@ -121,6 +155,7 @@ class StreamingSessionController:
             self._session.is_speaking = False
             self._session._arm_echo_guard()
             timeline.emit()
+            await self.refresh_stt_after_playback()
 
     async def _stt_event_loop(self) -> None:
         assert self._providers is not None
@@ -158,6 +193,12 @@ class StreamingSessionController:
     async def _handle_committed_transcript(self, text: str, event) -> None:
         session = self._session
         if session._closed or session._is_playing_welcome:
+            logger.info(
+                "STT committed ignored conn=%s playing_welcome=%s text=%r",
+                session.connection_id,
+                session._is_playing_welcome,
+                text[:80],
+            )
             return
         if self._turn_in_progress:
             return
@@ -278,6 +319,7 @@ class StreamingSessionController:
             session._arm_echo_guard()
             self._turn_in_progress = False
             self._cancel_turn = False
+            await self.refresh_stt_after_playback()
 
     def cancel_active_turn(self) -> None:
         self._cancel_turn = True

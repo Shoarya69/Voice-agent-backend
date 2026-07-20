@@ -30,6 +30,10 @@ class ElevenLabsStreamingSTTProvider(StreamingSTTProvider):
         self._event_queue: asyncio.Queue[STTEvent | None] = asyncio.Queue()
         self._reader_task: asyncio.Task | None = None
         self._closed = False
+        self._session_started = asyncio.Event()
+        self._connect_lock = asyncio.Lock()
+        self._chunks_sent = 0
+        self._reconnects = 0
 
     def _build_uri(self) -> str:
         base = config.ELEVENLABS_BASE_URL.rstrip("/").replace("https://", "wss://")
@@ -47,9 +51,38 @@ class ElevenLabsStreamingSTTProvider(StreamingSTTProvider):
         return f"{base}/v1/speech-to-text/realtime?{urlencode(params)}"
 
     async def connect(self) -> None:
+        await self._open_connection()
+
+    async def ensure_live(self) -> None:
+        """Reconnect if the STT websocket died (e.g. idle during long greeting TTS)."""
+        if self._closed:
+            return
+        if self._ws is not None and self._session_started.is_set():
+            return
+        async with self._connect_lock:
+            if self._ws is not None and self._session_started.is_set():
+                return
+            await self._open_connection()
+
+    async def _open_connection(self) -> None:
         if not config.ELEVENLABS_API_KEY:
             raise RuntimeError("ELEVENLABS_API_KEY is not configured")
 
+        if self._reader_task is not None and not self._reader_task.done():
+            self._reader_task.cancel()
+            try:
+                await self._reader_task
+            except asyncio.CancelledError:
+                pass
+
+        if self._ws is not None:
+            try:
+                await self._ws.close()
+            except Exception:
+                pass
+            self._ws = None
+
+        self._session_started.clear()
         uri = self._build_uri()
         self._ws = await websockets.connect(
             uri,
@@ -59,11 +92,31 @@ class ElevenLabsStreamingSTTProvider(StreamingSTTProvider):
             max_size=8 * 1024 * 1024,
         )
         self._reader_task = asyncio.create_task(self._read_loop())
-        logger.debug("ElevenLabs streaming STT connected for %s", self._connection_id)
+        try:
+            await asyncio.wait_for(self._session_started.wait(), timeout=8.0)
+        except asyncio.TimeoutError as exc:
+            raise RuntimeError("ElevenLabs STT session_started timeout") from exc
+
+        if self._reconnects:
+            logger.info(
+                "ElevenLabs STT reconnected conn=%s count=%s",
+                self._connection_id,
+                self._reconnects,
+            )
+        else:
+            logger.info(
+                "ElevenLabs STT session ready conn=%s model=%s",
+                self._connection_id,
+                config.STREAMING_STT_MODEL,
+            )
 
     async def send_audio(self, pcm: bytes, *, commit: bool = False) -> None:
-        if not pcm or self._ws is None or self._closed:
+        if not pcm or self._closed:
             return
+        await self.ensure_live()
+        if self._ws is None:
+            return
+
         payload = {
             "message_type": "input_audio_chunk",
             "audio_base_64": base64.b64encode(pcm).decode("ascii"),
@@ -72,8 +125,26 @@ class ElevenLabsStreamingSTTProvider(StreamingSTTProvider):
         }
         try:
             await self._ws.send(json.dumps(payload))
+            self._chunks_sent += 1
+            if self._chunks_sent in (1, 50, 200) or self._chunks_sent % 500 == 0:
+                logger.info(
+                    "STT audio forwarded conn=%s chunks=%s commit=%s",
+                    self._connection_id,
+                    self._chunks_sent,
+                    commit,
+                )
         except websockets.exceptions.ConnectionClosed as exc:
-            await self._push_error(f"STT websocket closed: {exc}")
+            logger.warning(
+                "STT websocket send failed conn=%s: %s — reconnecting",
+                self._connection_id,
+                exc,
+            )
+            self._ws = None
+            self._session_started.clear()
+            self._reconnects += 1
+            await self.ensure_live()
+            if self._ws is not None:
+                await self._ws.send(json.dumps(payload))
 
     async def events(self) -> AsyncIterator[STTEvent]:
         while True:
@@ -99,6 +170,7 @@ class ElevenLabsStreamingSTTProvider(StreamingSTTProvider):
         await self._event_queue.put(None)
 
     async def _push_error(self, message: str) -> None:
+        logger.error("STT error conn=%s: %s", self._connection_id, message)
         await self._event_queue.put(
             STTEvent(kind=STTEventKind.ERROR, error=message)
         )
@@ -115,7 +187,11 @@ class ElevenLabsStreamingSTTProvider(StreamingSTTProvider):
         except asyncio.CancelledError:
             raise
         except websockets.exceptions.ConnectionClosed:
-            pass
+            logger.warning(
+                "ElevenLabs STT reader disconnected conn=%s closed=%s",
+                self._connection_id,
+                self._closed,
+            )
         except Exception as exc:
             logger.error(
                 "ElevenLabs streaming STT reader error for %s: %s",
@@ -124,13 +200,17 @@ class ElevenLabsStreamingSTTProvider(StreamingSTTProvider):
             )
             await self._push_error(str(exc))
         finally:
-            await self._event_queue.put(None)
+            self._ws = None
+            self._session_started.clear()
+            if self._closed:
+                await self._event_queue.put(None)
 
     async def _handle_message(self, data: dict) -> None:
         msg_type = data.get("message_type") or data.get("type") or ""
 
         if msg_type == "session_started":
-            logger.debug(
+            self._session_started.set()
+            logger.info(
                 "ElevenLabs STT session_started conn=%s session_id=%s",
                 self._connection_id,
                 data.get("session_id"),
@@ -143,6 +223,11 @@ class ElevenLabsStreamingSTTProvider(StreamingSTTProvider):
                 await self._event_queue.put(
                     STTEvent(kind=STTEventKind.PARTIAL, text=text)
                 )
+                logger.info(
+                    "STT partial conn=%s text=%r",
+                    self._connection_id,
+                    text[:100],
+                )
             return
 
         if msg_type in ("committed_transcript", "committed_transcript_with_timestamps"):
@@ -151,6 +236,11 @@ class ElevenLabsStreamingSTTProvider(StreamingSTTProvider):
                 return
             language_code = data.get("language_code") or ""
             language_probability = data.get("language_probability")
+            logger.info(
+                "STT committed conn=%s text=%r",
+                self._connection_id,
+                text[:120],
+            )
             await self._event_queue.put(
                 STTEvent(
                     kind=STTEventKind.COMMITTED,
