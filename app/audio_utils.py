@@ -89,6 +89,18 @@ def pcm_duration_ms(pcm_bytes: bytes) -> float:
     return len(pcm_bytes) / bytes_per_ms
 
 
+def truncate_pcm_to_max_ms(pcm_bytes: bytes, max_ms: float) -> bytes:
+    """Truncate PCM to a maximum duration (Exotel 8kHz slin)."""
+    if not pcm_bytes or max_ms <= 0:
+        return b""
+    bytes_per_ms = config.SAMPLE_RATE * config.SAMPLE_WIDTH * config.CHANNELS / 1000
+    max_bytes = int(max_ms * bytes_per_ms)
+    if len(pcm_bytes) <= max_bytes:
+        return pcm_bytes
+    usable = max_bytes - (max_bytes % config.SAMPLE_WIDTH)
+    return pcm_bytes[:usable]
+
+
 def pcm_rms(pcm_bytes: bytes) -> float:
     """Return RMS amplitude for signed 16-bit little-endian PCM audio."""
     if not pcm_bytes:

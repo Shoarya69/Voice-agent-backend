@@ -343,11 +343,28 @@ class VoiceSession(VoicePipelineSession):
             config.ECHO_GUARD_MS / 1000
         )
 
+    async def on_agent_ready(self) -> None:
+        """Pre-connect streaming STT/TTS before greeting so caller audio works immediately after."""
+        if self._streaming.enabled:
+            try:
+                await self._streaming.ensure_connected()
+            except Exception as exc:
+                logger.error(
+                    "Streaming pipeline connect failed for %s: %s",
+                    self.connection_id,
+                    exc,
+                )
+
     async def _handle_streaming_audio(
         self, pcm: bytes, frames: list[bytes], now: float
     ) -> None:
+        # While the bot speaks the greeting, ignore inbound audio (telephony echo).
+        # Keep this window short — oversized greeting PCM blocks the caller for 20s+.
+        if self._is_playing_welcome:
+            return
+
         if not config.ENABLE_BARGE_IN and (
-            self.is_speaking or self._is_playing_welcome or now < self._echo_guard_until
+            self.is_speaking or now < self._echo_guard_until
         ):
             return
 
@@ -875,6 +892,13 @@ class VoiceSession(VoicePipelineSession):
         try:
             greeting_pcm = getattr(self, "greeting_audio_pcm", None)
             if greeting_pcm:
+                duration_ms = pcm_duration_ms(greeting_pcm)
+                logger.info(
+                    "🎙️ Playing pre-stored greeting for %s duration_ms=%.0f bytes=%s",
+                    self.connection_id,
+                    duration_ms,
+                    len(greeting_pcm),
+                )
                 frame_queue: asyncio.Queue = asyncio.Queue()
                 for frame in chunk_pcm(greeting_pcm):
                     await frame_queue.put(frame)

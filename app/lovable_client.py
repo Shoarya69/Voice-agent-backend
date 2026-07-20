@@ -49,6 +49,7 @@ import httpx
 
 from app import config
 from app import supabase_agent_provider
+from app.audio_utils import pcm_duration_ms
 
 logger = logging.getLogger(__name__)
 
@@ -160,7 +161,32 @@ def _number_cache_keys(number: str) -> list[str]:
     return keys or [number]
 
 
-def _decode_greeting_pcm(greeting: dict) -> bytes | None:
+def _normalize_greeting_pcm(pcm: bytes | None, *, agent_id: str = "") -> bytes | None:
+    """
+    Accept greeting PCM only if it fits telephony limits.
+
+    Moontech cold-cache sometimes returns 15–20s clips (~300KB+ @ 8kHz).
+    Those block STT (inbound audio is ignored while the bot speaks) and
+    sound like the agent is frozen / stuttering on a live call.
+    """
+    if not pcm:
+        return None
+    duration_ms = pcm_duration_ms(pcm)
+    max_ms = config.MAX_GREETING_AUDIO_MS
+    if duration_ms > max_ms:
+        logger.warning(
+            "Greeting PCM rejected agent_id=%s duration_ms=%.0f max_ms=%s bytes=%s "
+            "— will use live TTS greeting instead",
+            agent_id[:8] if agent_id else "",
+            duration_ms,
+            max_ms,
+            len(pcm),
+        )
+        return None
+    return pcm
+
+
+def _decode_greeting_pcm(greeting: dict, *, agent_id: str = "") -> bytes | None:
     """Decode pre-generated greeting audio (raw PCM 8kHz/16-bit/mono) from base64."""
     audio_b64 = (greeting or {}).get("audio_base64") or ""
     if not audio_b64.strip():
@@ -170,12 +196,12 @@ def _decode_greeting_pcm(greeting: dict) -> bytes | None:
     except (ValueError, binascii.Error):
         logger.warning("Invalid greeting.audio_base64 payload for agent greeting")
         return None
-    return pcm or None
+    return _normalize_greeting_pcm(pcm, agent_id=agent_id)
 
 
 def _parse_agent_config_payload(payload: dict, token: str = "") -> AgentConfig:
     greeting = payload.get("greeting") or {}
-    greeting_pcm = _decode_greeting_pcm(greeting)
+    greeting_pcm = _decode_greeting_pcm(greeting, agent_id=payload.get("agent_id", ""))
     first_message = payload.get("first_message") or greeting.get("text") or ""
 
     return AgentConfig(
@@ -418,10 +444,19 @@ async def _resolve_agent_bundle_impl(
     # Inbound: RPC already returned the full agent bundle — never re-query ai_agents.
     # Optionally fetch greeting PCM from Moontech only (cold-cache synth).
     if number and not token:
-        greeting = await supabase_agent_provider.fetch_greeting_from_moontech(
-            base.agent_id
-        )
-        pcm = _decode_greeting_pcm(greeting or {})
+        try:
+            greeting = await asyncio.wait_for(
+                supabase_agent_provider.fetch_greeting_from_moontech(base.agent_id),
+                timeout=config.GREETING_MOONTECH_TIMEOUT_SEC,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Moontech greeting fetch timed out agent_id=%s after %.1fs — live TTS",
+                base.agent_id,
+                config.GREETING_MOONTECH_TIMEOUT_SEC,
+            )
+            greeting = None
+        pcm = _decode_greeting_pcm(greeting or {}, agent_id=base.agent_id)
         if pcm:
             base.greeting_audio_pcm = pcm
             logger.info(

@@ -558,6 +558,7 @@ async def handle_websocket(websocket):
                     break
 
                 if agent_resolved:
+                    _commit_agent_config_to_session(session)
                     await session.on_agent_ready()
                     await session.speak_welcome()
                 else:

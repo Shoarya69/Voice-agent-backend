@@ -56,9 +56,10 @@ class StreamingSessionController:
             self._stt_task = asyncio.create_task(self._stt_event_loop())
             self._connected = True
             logger.info(
-                "Streaming pipeline ready conn=%s stt=%s tts=%s",
+                "Streaming pipeline ready conn=%s stt=%s model=%s tts=%s",
                 self._session.connection_id,
                 config.STT_PROVIDER,
+                config.STREAMING_STT_MODEL,
                 config.TTS_PROVIDER,
             )
 
