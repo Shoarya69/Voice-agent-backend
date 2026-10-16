@@ -50,10 +50,18 @@ class StreamingSessionController:
             if self._connected:
                 return
             self._providers = build_streaming_providers(self._session.connection_id)
-            async with stt_semaphore:
-                await self._providers.stt.connect()
+            # TTS first so Vobiz/exotel callers hear greeting even if STT auth is misconfigured.
             await self._providers.tts.connect()
-            self._stt_task = asyncio.create_task(self._stt_event_loop())
+            try:
+                async with stt_semaphore:
+                    await self._providers.stt.connect()
+                self._stt_task = asyncio.create_task(self._stt_event_loop())
+            except Exception as exc:
+                logger.error(
+                    "Streaming STT connect failed conn=%s (TTS ok — greeting will play): %s",
+                    self._session.connection_id,
+                    exc,
+                )
             self._connected = True
             logger.info(
                 "Streaming pipeline ready conn=%s stt=%s model=%s tts=%s",
@@ -68,6 +76,8 @@ class StreamingSessionController:
             return
         await self.ensure_connected()
         assert self._providers is not None
+        if self._stt_task is None:
+            return
         await self._ensure_stt_listener()
         stt = self._providers.stt
         if hasattr(stt, "ensure_live"):

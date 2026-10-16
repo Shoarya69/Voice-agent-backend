@@ -204,31 +204,84 @@ def _row_from_completed_payload(payload: dict[str, Any]) -> dict[str, Any]:
     return row
 
 
+def _is_upsert_conflict_error(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    return "42p10" in msg or "on conflict" in msg or "on_conflict" in msg
+
+
 async def _supabase_upsert(row: dict[str, Any]) -> None:
     if not config.ENABLE_SUPABASE_CALL_RECORDS:
         return
     if not supabase_agent_provider.is_configured():
         return
-    if not row.get("call_sid"):
+    call_sid = row.get("call_sid")
+    if not call_sid:
         return
 
-    try:
-        client = await supabase_agent_provider._get_supabase()  # noqa: SLF001
-        await supabase_agent_provider._run_sync(  # noqa: SLF001
+    client = await supabase_agent_provider._get_supabase()  # noqa: SLF001
+    run_sync = supabase_agent_provider._run_sync  # noqa: SLF001
+
+    async def _try_upsert() -> None:
+        await run_sync(
             lambda: client.table(AI_CALLS_TABLE)
             .upsert(row, on_conflict="call_sid")
             .execute()
         )
+
+    async def _insert_or_update() -> None:
+        """Fallback when DB has no UNIQUE(call_sid) — common on older Moontech schemas."""
+
+        def _select():
+            return (
+                client.table(AI_CALLS_TABLE)
+                .select("call_sid")
+                .eq("call_sid", call_sid)
+                .limit(1)
+                .execute()
+            )
+
+        existing = await run_sync(_select)
+        data = getattr(existing, "data", None) or []
+        if data:
+            patch = {k: v for k, v in row.items() if k != "call_sid" and v is not None}
+
+            def _update():
+                return (
+                    client.table(AI_CALLS_TABLE)
+                    .update(patch)
+                    .eq("call_sid", call_sid)
+                    .execute()
+                )
+
+            await run_sync(_update)
+        else:
+
+            def _insert():
+                return client.table(AI_CALLS_TABLE).insert(row).execute()
+
+            await run_sync(_insert)
+
+    try:
+        try:
+            await _try_upsert()
+        except Exception as exc:
+            if _is_upsert_conflict_error(exc):
+                logger.warning(
+                    "ai_calls upsert on_conflict=call_sid unsupported — using select/update fallback"
+                )
+                await _insert_or_update()
+            else:
+                raise
         logger.info(
             "Supabase ai_calls upsert ok call_sid=%s provider=%s status=%s",
-            row.get("call_sid"),
+            call_sid,
             row.get("provider"),
             row.get("status"),
         )
     except Exception as exc:
         logger.error(
             "Supabase ai_calls upsert failed call_sid=%s error=%s",
-            row.get("call_sid"),
+            call_sid,
             exc,
         )
 

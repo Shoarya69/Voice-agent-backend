@@ -31,6 +31,7 @@ class ElevenLabsStreamingSTTProvider(StreamingSTTProvider):
         self._reader_task: asyncio.Task | None = None
         self._closed = False
         self._session_started = asyncio.Event()
+        self._auth_failed = asyncio.Event()
         self._connect_lock = asyncio.Lock()
         self._chunks_sent = 0
         self._reconnects = 0
@@ -83,6 +84,7 @@ class ElevenLabsStreamingSTTProvider(StreamingSTTProvider):
             self._ws = None
 
         self._session_started.clear()
+        self._auth_failed.clear()
         uri = self._build_uri()
         self._ws = await websockets.connect(
             uri,
@@ -93,7 +95,23 @@ class ElevenLabsStreamingSTTProvider(StreamingSTTProvider):
         )
         self._reader_task = asyncio.create_task(self._read_loop())
         try:
-            await asyncio.wait_for(self._session_started.wait(), timeout=8.0)
+            started = asyncio.create_task(self._session_started.wait())
+            auth_fail = asyncio.create_task(self._auth_failed.wait())
+            done, pending = await asyncio.wait(
+                {started, auth_fail},
+                return_when=asyncio.FIRST_COMPLETED,
+                timeout=8.0,
+            )
+            for task in pending:
+                task.cancel()
+            if self._auth_failed.is_set():
+                raise RuntimeError(
+                    "ElevenLabs STT authentication failed — verify ELEVENLABS_API_KEY "
+                    "(Speech-to-Text access), STREAMING_STT_MODEL=scribe_v2_realtime, "
+                    "and ELEVENLABS_BASE_URL region matches your account"
+                )
+            if not self._session_started.is_set():
+                raise RuntimeError("ElevenLabs STT session_started timeout")
         except asyncio.TimeoutError as exc:
             raise RuntimeError("ElevenLabs STT session_started timeout") from exc
 
@@ -253,4 +271,6 @@ class ElevenLabsStreamingSTTProvider(StreamingSTTProvider):
 
         if msg_type in ("error", "auth_error", "quota_exceeded", "rate_limited"):
             error = data.get("error") or data.get("message") or msg_type
+            if msg_type == "auth_error":
+                self._auth_failed.set()
             await self._push_error(str(error))

@@ -475,25 +475,8 @@ async def _resolve_agent_bundle_impl(
         )
         return base
 
-    # Token / outbound: agent-by-token HTTP already has prompt + voice. Do NOT call
-    # fetch_agent_with_greeting here — it re-queries Supabase ai_agents (RLS with anon
-    # key) and Moontech agent-with-greeting (~3–6s), which exceeds Vobiz time-to-first-audio.
-    if not base.greeting_audio_pcm:
-        try:
-            greeting = await asyncio.wait_for(
-                supabase_agent_provider.fetch_greeting_from_moontech(base.agent_id),
-                timeout=config.GREETING_MOONTECH_TIMEOUT_SEC,
-            )
-        except asyncio.TimeoutError:
-            logger.warning(
-                "Moontech greeting fetch timed out agent_id=%s — live TTS for token call",
-                base.agent_id,
-            )
-            greeting = None
-        pcm = _decode_greeting_pcm(greeting or {}, agent_id=base.agent_id)
-        if pcm:
-            base.greeting_audio_pcm = pcm
-
+    # Token / outbound: get_agent_bundle_by_token RPC already returns prompt, voice,
+    # greeting text, and optional greeting audio — skip extra Moontech HTTP (~2.5s).
     logger.info(
         "LATENCY bundle agent_id=%s greeting=%s ms=%.0f",
         base.agent_id,

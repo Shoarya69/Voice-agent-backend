@@ -624,10 +624,39 @@ async def handle_websocket(websocket):
         )
 
 
+async def _probe_elevenlabs_api_key() -> None:
+    if not config.ELEVENLABS_API_KEY or config.VOICE_PIPELINE == "openai_realtime":
+        return
+    import httpx
+
+    url = f"{config.ELEVENLABS_BASE_URL.rstrip('/')}/v1/user"
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            resp = await client.get(
+                url, headers={"xi-api-key": config.ELEVENLABS_API_KEY}
+            )
+        if resp.status_code == 401:
+            logger.error(
+                "❌ ELEVENLABS_API_KEY rejected (401) — calls will not transcribe or speak. "
+                "Fix the key in .env and ensure Speech-to-Text is enabled on your ElevenLabs plan."
+            )
+        elif resp.is_success:
+            logger.info("✅ ElevenLabs API key accepted (user profile OK)")
+        else:
+            logger.warning(
+                "ElevenLabs key probe returned HTTP %s — verify ELEVENLABS_API_KEY",
+                resp.status_code,
+            )
+    except Exception as exc:
+        logger.warning("ElevenLabs key probe skipped: %s", exc)
+
+
 async def main():
     warnings = config.validate()
     for warning in warnings:
         logger.warning("⚠️  %s", warning)
+
+    await _probe_elevenlabs_api_key()
 
     logger.info("🚀 Starting AI Voice Agent Server...")
     logger.info("📡 Listening on %s:%s", config.HOST, config.PORT)
@@ -643,11 +672,16 @@ async def main():
 
     if pipeline == "compound":
         logger.info("🧠 Brain: OpenAI model '%s'", config.OPENAI_MODEL)
+        stt_label = (
+            config.STREAMING_STT_MODEL
+            if config.STREAMING_PIPELINE and config.STT_PROVIDER == "elevenlabs"
+            else config.ELEVENLABS_STT_MODEL
+        )
         logger.info(
             "🗣️  Voice: ElevenLabs voice '%s' (TTS model '%s', STT model '%s')",
             config.ELEVENLABS_VOICE_ID,
             config.ELEVENLABS_TTS_MODEL,
-            config.ELEVENLABS_STT_MODEL,
+            stt_label,
         )
         logger.info(
             "⚙️  Capacity: max_sessions=%s stt=%s tts=%s vad_threads=%s",

@@ -164,7 +164,7 @@ MANDATORY_PLATFORM_RULES_HEADER = (
 # ---------------------------------------------------------------------------
 # ElevenLabs (Speech-to-Text + Text-to-Speech)
 # ---------------------------------------------------------------------------
-ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", "")
+ELEVENLABS_API_KEY = (os.getenv("ELEVENLABS_API_KEY", "") or "").strip().strip('"').strip("'")
 _ELEVENLABS_VOICE_ID_DEFAULT = os.getenv("ELEVENLABS_VOICE_ID", "21m00Tcm4TlvDq8ikWAM")
 ELEVENLABS_TTS_MODEL = os.getenv("ELEVENLABS_TTS_MODEL", "eleven_turbo_v2_5")
 ELEVENLABS_STT_MODEL = os.getenv("ELEVENLABS_STT_MODEL", "scribe_v1")
@@ -348,6 +348,17 @@ def validate() -> list:
         warnings.append(
             "ELEVENLABS_API_KEY is not set - speech-to-text and text-to-speech will not work."
         )
+    elif pipeline == "compound" and ELEVENLABS_API_KEY:
+        if len(ELEVENLABS_API_KEY) < 20:
+            warnings.append(
+                "ELEVENLABS_API_KEY looks too short — STT/TTS will fail with auth errors."
+            )
+        if STREAMING_PIPELINE and STT_PROVIDER == "elevenlabs":
+            if STREAMING_STT_MODEL != "scribe_v2_realtime":
+                warnings.append(
+                    f"STREAMING_STT_MODEL={STREAMING_STT_MODEL!r} may not work on the "
+                    "realtime WebSocket — use scribe_v2_realtime for compound streaming STT."
+                )
     if (
         pipeline == "compound"
         and STREAMING_PIPELINE
