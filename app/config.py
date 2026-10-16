@@ -57,6 +57,19 @@ WEBHOOK_PORT = _get_int("WEBHOOK_PORT", 8081)
 PREWARM_ON_EXOTEL_STATUS = _get_bool("PREWARM_ON_EXOTEL_STATUS", True)
 
 # ---------------------------------------------------------------------------
+# Vobiz telephony (μ-law bidirectional stream on VOBIZ_WS_PATH, default /ws)
+# ---------------------------------------------------------------------------
+# Public hostname for Stream XML (no scheme), e.g. voice.moontechpro.com
+PUBLIC_HOST = os.getenv("PUBLIC_HOST", "").strip()
+VOBIZ_WS_PATH = os.getenv("VOBIZ_WS_PATH", "/ws").strip() or "/ws"
+VOBIZ_ENABLED = _get_bool("VOBIZ_ENABLED", True)
+# μ-law playAudio chunk size (40 ms @ 8 kHz = 320 bytes)
+VOBIZ_ULAW_PLAY_CHUNK = _get_int("VOBIZ_ULAW_PLAY_CHUNK", 320)
+
+# Persist call rows to Supabase ai_calls (in addition to Lovable call-log POST).
+ENABLE_SUPABASE_CALL_RECORDS = _get_bool("ENABLE_SUPABASE_CALL_RECORDS", True)
+
+# ---------------------------------------------------------------------------
 # Concurrency / capacity (tuned for ~6 vCPU / 12 GB — target 100–150 sessions)
 # ---------------------------------------------------------------------------
 MAX_CONCURRENT_SESSIONS = _get_int("MAX_CONCURRENT_SESSIONS", 150)

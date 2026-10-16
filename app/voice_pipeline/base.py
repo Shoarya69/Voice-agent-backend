@@ -50,6 +50,8 @@ class VoicePipelineSession(ABC):
         self.greeting_audio_pcm: bytes | None = None
 
         # Call metadata (CRM / call-log)
+        self.telephony_provider: str = "exotel"
+        self.call_direction: str = "inbound"
         self.call_started_at = None
         self.caller_from: str | None = None
         self.caller_to: str | None = None

@@ -11,6 +11,82 @@ import struct
 
 from app import config
 
+try:
+    import audioop
+except ImportError:  # Python 3.13+
+    audioop = None  # type: ignore[assignment]
+
+# G.711 μ-law (Vobiz media) ↔ PCM slin (Exotel / internal pipeline)
+_ULAW_BIAS = 0x84
+_ULAW_CLIP = 32635
+_ULAW_EXP_TABLE = (
+    0, 0, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3,
+    4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+    5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5,
+    5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5,
+    6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6,
+    6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6,
+    6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6,
+    6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6,
+    7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+    7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+    7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+    7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+    7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+    7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+    7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+    7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+)
+
+
+def _linear2ulaw(sample: int) -> int:
+    sign = (sample >> 8) & 0x80
+    if sign:
+        sample = -sample
+    if sample > _ULAW_CLIP:
+        sample = _ULAW_CLIP
+    sample += _ULAW_BIAS
+    exponent = _ULAW_EXP_TABLE[(sample >> 7) & 0xFF]
+    mantissa = (sample >> (exponent + 3)) & 0x0F
+    return ~(sign | (exponent << 4) | mantissa) & 0xFF
+
+
+def _ulaw2linear(ulaw_byte: int) -> int:
+    ulaw_byte = ~ulaw_byte & 0xFF
+    sign = ulaw_byte & 0x80
+    exponent = (ulaw_byte >> 4) & 0x07
+    mantissa = ulaw_byte & 0x0F
+    sample = ((mantissa << 3) + _ULAW_BIAS) << exponent
+    sample -= _ULAW_BIAS
+    return -sample if sign else sample
+
+
+def ulaw_bytes_to_pcm(ulaw_bytes: bytes) -> bytes:
+    """Decode G.711 μ-law 8 kHz to signed 16-bit LE PCM."""
+    if not ulaw_bytes:
+        return b""
+    if audioop is not None:
+        return audioop.ulaw2lin(ulaw_bytes, 2)
+    out = bytearray()
+    for b in ulaw_bytes:
+        out.extend(struct.pack("<h", _ulaw2linear(b)))
+    return bytes(out)
+
+
+def pcm_bytes_to_ulaw(pcm_bytes: bytes) -> bytes:
+    """Encode signed 16-bit LE PCM to G.711 μ-law."""
+    if not pcm_bytes:
+        return b""
+    sample_bytes = pcm_bytes[: len(pcm_bytes) - (len(pcm_bytes) % 2)]
+    if not sample_bytes:
+        return b""
+    if audioop is not None:
+        return audioop.lin2ulaw(sample_bytes, 2)
+    out = bytearray()
+    for (sample,) in struct.iter_unpack("<h", sample_bytes):
+        out.append(_linear2ulaw(sample))
+    return bytes(out)
+
 
 def decode_payload(payload_b64: str) -> bytes:
     """Decode a base64 Exotel media payload into raw PCM bytes."""

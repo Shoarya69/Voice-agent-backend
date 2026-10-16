@@ -117,6 +117,7 @@ class AgentConfig:
     tone: str = ""
     greeting_audio_pcm: bytes | None = None
     channel_reservation_id: str = ""
+    phone_number_id: str = ""
 
     def as_overrides(self) -> dict:
         """Fields consumed by app.config's per-call override mechanism."""
@@ -223,6 +224,7 @@ def _parse_agent_config_payload(payload: dict, token: str = "") -> AgentConfig:
             or payload.get("reservation_id")
             or ""
         ),
+        phone_number_id=str(payload.get("phone_number_id") or ""),
     )
 
 

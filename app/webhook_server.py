@@ -25,7 +25,8 @@ import logging
 
 from aiohttp import web
 
-from app import config, lovable_client
+from app import call_records, config, lovable_client
+from app.telephony.vobiz import http as vobiz_http
 
 logger = logging.getLogger(__name__)
 
@@ -124,6 +125,7 @@ async def _handle_status(request: web.Request) -> web.Response:
         form.get("To"),
     )
     await _maybe_prewarm_from_exotel_status(form)
+    await call_records.merge_provider_hangup("exotel", form)
     await lovable_client.post_exotel_status(number, form)
     return web.Response(text="OK")
 
@@ -151,6 +153,8 @@ def _build_app() -> web.Application:
     app.router.add_post("/exotel/conversation", _handle_conversation)
     app.router.add_post("/voicebot/prewarm", _handle_prewarm)
     app.router.add_get("/health", _handle_health)
+    if config.VOBIZ_ENABLED:
+        vobiz_http.register_routes(app)
     return app
 
 
@@ -162,9 +166,11 @@ async def start() -> web.AppRunner:
     site = web.TCPSite(runner, config.HOST, config.WEBHOOK_PORT)
     await site.start()
     logger.info(
-        "🌐 Exotel webhook relay listening on http://%s:%s (/exotel/status, /exotel/conversation, /voicebot/prewarm)",
+        "🌐 Webhook HTTP listening on http://%s:%s "
+        "(/exotel/status, /exotel/conversation, /voicebot/prewarm%s)",
         config.HOST,
         config.WEBHOOK_PORT,
+        ", /vobiz/answer, /vobiz/hangup" if config.VOBIZ_ENABLED else "",
     )
     return runner
 

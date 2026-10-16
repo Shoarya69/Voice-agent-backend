@@ -29,7 +29,7 @@ from urllib.parse import parse_qs, urlparse
 
 import websockets
 
-from app import config, lovable_client, webhook_server
+from app import call_records, config, lovable_client, webhook_server
 from app.agent_setup import load_agent_bundle_into_session, start_agent_prefetch
 from app.elevenlabs_service import elevenlabs_service
 from app.openai_service import openai_brain
@@ -154,6 +154,10 @@ def _extract_wss_route(websocket) -> tuple[str | None, str | None, str | None]:
     values = parse_qs(query).get("token") if query else None
     if values and values[0]:
         return "token", values[0], path
+
+    number_values = parse_qs(query).get("number") if query else None
+    if number_values and number_values[0]:
+        return "number", number_values[0], path
 
     if parsed is not None:
         segments = [seg for seg in parsed.path.split("/") if seg]
@@ -299,68 +303,42 @@ async def _speak_fallback_and_close(session: VoicePipelineSession, connection_id
         pass
 
 
-def _iso_z(dt: datetime) -> str:
-    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+def _post_call_log_once(session: VoicePipelineSession) -> None:
+    """Post the call log exactly once (Supabase + Lovable)."""
+    call_records.schedule_finalize_call(session)
 
 
-def _transcript_role(role: str) -> str:
-    if role == "assistant":
-        return "agent"
-    return role if role in ("user", "agent") else "user"
+async def _resolve_agent_on_start(
+    session: VoicePipelineSession,
+    connection_id: str,
+    start_data: dict,
+) -> bool:
+    """
+    Resolve agent from WSS token/number route, or inbound fallback to dialed ``to``.
+    """
+    if session.wss_route_kind in ("number", "token"):
+        return await _await_agent_prefetch(session, connection_id)
 
-
-def _build_call_log_payload(session: VoicePipelineSession, ended_at: datetime) -> dict:
-    started_at = getattr(session, "call_started_at", None) or ended_at
-    duration_seconds = max(0, int((ended_at - started_at).total_seconds()))
-
-    history = getattr(session, "history", []) or []
-    total = len(history)
-    transcript = []
-    for index, entry in enumerate(history):
-        # Per-turn timestamps aren't tracked in session.history today, so
-        # we approximate by spreading entries evenly across the call.
-        fraction = index / (total - 1) if total > 1 else 0.0
-        entry_ts = started_at + (ended_at - started_at) * fraction
-        transcript.append(
-            {
-                "role": _transcript_role(entry.get("role", "assistant")),
-                "text": entry.get("content", ""),
-                "ts": int(entry_ts.timestamp()),
-            }
+    fallback_number = (
+        start_data.get("to")
+        or start_data.get("To")
+        or session.caller_to
+    )
+    if fallback_number:
+        logger.info(
+            "Inbound fallback agent lookup by to=...%s conn=%s",
+            str(fallback_number)[-4:],
+            connection_id,
+        )
+        session.wss_route_kind = "number"
+        session.wss_route_value = str(fallback_number)
+        return await load_agent_bundle_into_session(
+            session,
+            connection_id,
+            number=str(fallback_number),
         )
 
-    agent_config = getattr(session, "agent_config", None)
-    payload = {
-        "call_sid": session.call_sid,
-        "user_id": agent_config.user_id if agent_config else "",
-        "agent_id": getattr(session, "agent_id", None) or (agent_config.agent_id if agent_config else ""),
-        "from_number": getattr(session, "caller_from", None),
-        "to_number": getattr(session, "caller_to", None),
-        "direction": "inbound",
-        "duration_seconds": duration_seconds,
-        "started_at": _iso_z(started_at),
-        "ended_at": _iso_z(ended_at),
-        "transcript": transcript,
-    }
-
-    recording_url = getattr(session, "recording_url", None)
-    if recording_url:
-        payload["recording_url"] = recording_url
-
-    return payload
-
-
-def _post_call_log_once(session: VoicePipelineSession) -> None:
-    """Post the call log exactly once, regardless of how the call ended."""
-    if getattr(session, "_call_log_posted", False):
-        return
-    if not (getattr(session, "agent_config", None) or getattr(session, "agent_id", None)):
-        return
-
-    session._call_log_posted = True
-    ended_at = datetime.now(timezone.utc)
-    payload = _build_call_log_payload(session, ended_at)
-    asyncio.create_task(lovable_client.post_call_log(payload))
+    return False
 
 
 def _session_release_token(session: VoicePipelineSession) -> str:
@@ -458,6 +436,17 @@ async def _finalize_call_session(
 
 
 async def handle_websocket(websocket):
+    request_path = _extract_request_path(websocket)
+    if request_path:
+        from app.telephony.vobiz.ws_handler import (
+            handle_vobiz_websocket,
+            is_vobiz_websocket_path,
+        )
+
+        if is_vobiz_websocket_path(request_path):
+            await handle_vobiz_websocket(websocket)
+            return
+
     connection_id = f"conn_{int(datetime.now().timestamp() * 1000)}"
 
     if not await try_acquire_session():
@@ -486,6 +475,7 @@ async def handle_websocket(websocket):
         )
 
         session = create_voice_pipeline_session(connection_id, websocket)
+        session.telephony_provider = "exotel"
         logger.info(
             "🎛️ Voice pipeline for %s: %s",
             connection_id,
@@ -534,22 +524,26 @@ async def handle_websocket(websocket):
                 session.call_started_at = datetime.now(timezone.utc)
                 session.caller_from = start_data.get("from")
                 session.caller_to = start_data.get("to")
+                call_records.apply_start_metadata(session, start_data)
                 logger.info(
-                    "🚀 START - %s | call_sid=%s stream_sid=%s from=%s to=%s",
+                    "🚀 START - %s | call_sid=%s stream_sid=%s from=%s to=%s provider=%s direction=%s",
                     connection_id,
                     session.call_sid,
                     session.stream_sid,
                     session.caller_from,
                     session.caller_to,
+                    session.telephony_provider,
+                    session.call_direction,
                 )
                 _log_call_started(session, connection_id)
 
-                if session.wss_route_kind in ("number", "token"):
-                    agent_resolved = await _await_agent_prefetch(session, connection_id)
-                else:
+                agent_resolved = await _resolve_agent_on_start(
+                    session, connection_id, start_data
+                )
+                if not agent_resolved and session.wss_route_kind not in ("number", "token"):
                     logger.error(
-                        "missing voicebot token or number in wss url — check Exotel Flow "
-                        "Stream URL config (connection=%s, raw_path=%r)",
+                        "missing voicebot token/number in wss url and no to= on start "
+                        "(connection=%s, raw_path=%r)",
                         connection_id,
                         request_path,
                     )
@@ -559,6 +553,7 @@ async def handle_websocket(websocket):
 
                 if agent_resolved:
                     _commit_agent_config_to_session(session)
+                    call_records.schedule_call_started(session)
                     await session.on_agent_ready()
                     await session.speak_welcome()
                 else:
@@ -619,6 +614,13 @@ async def main():
 
     logger.info("🚀 Starting AI Voice Agent Server...")
     logger.info("📡 Listening on %s:%s", config.HOST, config.PORT)
+    if config.VOBIZ_ENABLED:
+        logger.info(
+            "📞 Vobiz media WebSocket path: %s (wss://%s%s)",
+            config.VOBIZ_WS_PATH,
+            config.PUBLIC_HOST or "<PUBLIC_HOST>",
+            config.VOBIZ_WS_PATH,
+        )
     pipeline = get_pipeline_name()
     logger.info("🎛️ Voice pipeline: %s (VOICE_PIPELINE=%s)", pipeline, config.VOICE_PIPELINE or "compound")
 
