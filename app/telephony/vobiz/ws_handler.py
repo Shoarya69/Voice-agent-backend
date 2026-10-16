@@ -17,6 +17,8 @@ from app.runtime import (
     release_session_slot,
     try_acquire_session,
 )
+from app.agent_setup import load_agent_bundle_into_session
+from app.telephony.vobiz.metadata import extract_call_sid, extract_parties, extract_stream_id
 from app.telephony.vobiz.session import VobizCompoundSession
 from app.telephony.vobiz.stream import VobizStream
 
@@ -106,28 +108,33 @@ async def handle_vobiz_websocket(websocket) -> None:
             event_type = data.get("event")
 
             if event_type == "start":
-                start_data = data.get("start", data)
-                vobiz.stream_id = start_data.get("streamId")
+                start_data = data.get("start") or data
+                if not isinstance(start_data, dict):
+                    start_data = data
+                vobiz.stream_id = extract_stream_id(data, start_data)
                 session.stream_sid = vobiz.stream_id
-                session.call_sid = (
-                    start_data.get("callId")
-                    or start_data.get("callUUID")
-                    or start_data.get("CallUUID")
-                )
+                session.call_sid = extract_call_sid(data, start_data)
                 session.call_started_at = datetime.now(timezone.utc)
-                session.caller_from = start_data.get("from") or start_data.get("From")
-                session.caller_to = start_data.get("to") or start_data.get("To")
+                session.caller_from, session.caller_to = extract_parties(data, start_data)
                 call_records.apply_start_metadata(session, start_data)
                 logger.info(
-                    "🚀 Vobiz START %s call_sid=%s stream=%s from=%s to=%s route=%s direction=%s",
+                    "🚀 Vobiz START %s call_sid=%s stream=%s from=%s to=%s "
+                    "route=%s/%s direction=%s start_keys=%s",
                     connection_id,
                     session.call_sid,
                     session.stream_sid,
                     session.caller_from,
                     session.caller_to,
                     session.wss_route_kind,
+                    (session.wss_route_value or "")[:12],
                     session.call_direction,
+                    sorted(start_data.keys()),
                 )
+                if not vobiz.stream_id:
+                    logger.error(
+                        "Vobiz start missing streamId conn=%s — playAudio will fail",
+                        connection_id,
+                    )
                 voice_server._log_call_started(session, connection_id)
 
                 agent_resolved = await voice_server._resolve_agent_on_start(

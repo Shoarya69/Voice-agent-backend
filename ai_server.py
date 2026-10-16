@@ -316,8 +316,25 @@ async def _resolve_agent_on_start(
     """
     Resolve agent from WSS token/number route, or inbound fallback to dialed ``to``.
     """
-    if session.wss_route_kind in ("number", "token"):
-        return await _await_agent_prefetch(session, connection_id)
+    if session.wss_route_kind == "token" and session.wss_route_value:
+        ok = await _await_agent_prefetch(session, connection_id)
+        if ok:
+            return True
+        return await load_agent_bundle_into_session(
+            session,
+            connection_id,
+            token=session.wss_route_value,
+        )
+
+    if session.wss_route_kind == "number" and session.wss_route_value:
+        ok = await _await_agent_prefetch(session, connection_id)
+        if ok:
+            return True
+        return await load_agent_bundle_into_session(
+            session,
+            connection_id,
+            number=session.wss_route_value,
+        )
 
     fallback_number = (
         start_data.get("to")

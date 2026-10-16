@@ -364,7 +364,16 @@ def validate() -> list:
             "Supabase not fully configured - agent reads fall back to Moontech HTTP. "
             "Set SUPABASE_URL plus SUPABASE_SERVICE_ROLE_KEY (preferred) or SUPABASE_ANON_KEY."
         )
-    elif SUPABASE_ANON_KEY and not SUPABASE_SERVICE_ROLE_KEY:
+    if VOBIZ_ENABLED and not PUBLIC_HOST:
+        warnings.append(
+            "PUBLIC_HOST is not set — Vobiz /vobiz/answer cannot build a valid wss:// Stream URL."
+        )
+    if VOBIZ_ENABLED and PUBLIC_HOST and "voice.moontechpro.com" in PUBLIC_HOST:
+        warnings.append(
+            "PUBLIC_HOST=voice.moontechpro.com — Vobiz Stream will NOT hit this VPS unless "
+            "that host points here. For Nexobulk use PUBLIC_HOST=aicalling.nexobulkindia.com"
+        )
+    if SUPABASE_ANON_KEY and not SUPABASE_SERVICE_ROLE_KEY:
         warnings.append(
             "Using SUPABASE_ANON_KEY (publishable) for agent reads — requires Moontech "
             "RLS policies; if lookups fail, Moontech HTTP fallback is used automatically."

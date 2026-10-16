@@ -85,6 +85,69 @@ class VobizCompoundSession(CompoundPipelineSession):
     async def handle_clear(self) -> None:
         await super().handle_clear()
 
+    def _welcome_text(self) -> str:
+        text = (config.WELCOME_MESSAGE or "").strip()
+        if text:
+            words = text.split()
+            if len(words) <= config.MAX_WELCOME_WORDS:
+                return text
+            return " ".join(words[: config.MAX_WELCOME_WORDS]).strip()
+        agent = getattr(self, "agent_config", None)
+        if agent and (agent.first_message or "").strip():
+            return agent.first_message.strip()
+        return "Namaste, main aapki madad ke liye hoon."
+
+    async def speak_welcome(self) -> None:
+        """
+        Vobiz often drops the call if no playAudio within a few seconds.
+        Must await greeting TTS/PCM before handling more events.
+        """
+        if not config.ENABLE_WELCOME_MESSAGE:
+            await self._speak_minimal_vobiz_greeting(self._welcome_text())
+            return
+
+        welcome = self._welcome_text()
+        if not welcome.strip():
+            await self._speak_minimal_vobiz_greeting(
+                "Namaste, main aapki madad ke liye hoon."
+            )
+            return
+
+        self.history.append({"role": "assistant", "content": welcome})
+        self._set_response_task(self._speak_welcome())
+
+        task = self._response_task
+        if task is None:
+            await self._speak_minimal_vobiz_greeting(welcome)
+            return
+        try:
+            await task
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error(
+                "Vobiz greeting task failed conn=%s: %s",
+                self.connection_id,
+                exc,
+            )
+            await self._speak_minimal_vobiz_greeting(welcome)
+
+    async def _speak_minimal_vobiz_greeting(self, text: str) -> None:
+        """Last-resort audio so Vobiz does not tear down an silent stream."""
+        self._is_playing_welcome = True
+        try:
+            if self._streaming.enabled:
+                await self._streaming.ensure_connected()
+                await self._streaming.speak_text(text[:200])
+            else:
+                sentence_queue: asyncio.Queue = asyncio.Queue()
+                await sentence_queue.put(text[:200])
+                await sentence_queue.put(None)
+                await self._speak_from_sentence_queue(sentence_queue)
+        finally:
+            self._is_playing_welcome = False
+            self._arm_echo_guard()
+
     async def close(self) -> None:
         self._ulaw_out_buffer.clear()
         self._vobiz.closed = True
