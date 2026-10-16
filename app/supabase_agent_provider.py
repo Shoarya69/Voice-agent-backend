@@ -2,7 +2,8 @@
 Direct Supabase reads for agent config (replaces Moontech HTTP GET endpoints).
 
 Inbound (by number): single RPC ``get_inbound_agent_bundle``.
-Outbound (by token): Supabase tables + Moontech greeting cold-cache when needed.
+Outbound (by token): single RPC ``get_agent_bundle_by_token`` (anon-safe; no direct
+``voicebot_call_tokens`` / ``ai_agents`` REST reads).
 Greeting enrichment: Moontech HTTP only when PCM not cached (write-side synth).
 
 Write paths (call-log, webhooks) stay on Moontech via lovable_client.
@@ -13,7 +14,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import quote
 
@@ -31,6 +31,7 @@ AGENT_COLS = (
 )
 
 _INBOUND_AGENT_RPC = "get_inbound_agent_bundle"
+_TOKEN_AGENT_RPC = "get_agent_bundle_by_token"
 
 _DEFAULT_VOICE_ID = "cgSgspJ2msm6clMCkdW9"
 _DEFAULT_SYSTEM_PROMPT = "You are a helpful voice assistant."
@@ -363,114 +364,52 @@ async def fetch_agent_payload_by_number(number: str) -> dict[str, Any]:
 
 
 async def fetch_agent_payload_by_token(token: str) -> dict[str, Any]:
-    if not token or len(token) < 16:
+    """
+    Resolve outbound / token agent bundle via Supabase RPC (single call, anon-safe).
+
+    Replaces direct REST reads to ``voicebot_call_tokens`` and ``ai_agents`` (blocked
+    by RLS for publishable keys). Same field shape as ``get_inbound_agent_bundle``.
+    """
+    raw = (token or "").strip()
+    if not raw or len(raw) < 16:
         raise SupabaseAgentError("missing or invalid token", status_code=400)
 
     client = await _get_supabase()
-    override_script = None
-    override_customer_name = None
-    agent_id_from_call_token = None
 
-    def _fetch_call_token():
-        return (
-            client.table("voicebot_call_tokens")
-            .select("agent_id, overrides, expires_at")
-            .eq("token", token)
-            .maybe_single()
-            .execute()
+    def _rpc_call():
+        return client.rpc(_TOKEN_AGENT_RPC, {"_token": raw}).execute()
+
+    try:
+        result = await _run_sync(_rpc_call)
+    except SupabaseAgentError:
+        raise
+    except Exception as exc:
+        logger.exception(
+            "get_agent_bundle_by_token RPC failed token=%s...",
+            raw[:8],
         )
+        raise SupabaseAgentError(f"token agent lookup failed: {exc}") from exc
 
-    call_tok_result = await _run_sync(_fetch_call_token)
-    call_tok = _extract_supabase_data(call_tok_result)
-    if not call_tok:
+    data = result.data
+    row: dict[str, Any] | None = None
+    if isinstance(data, list):
+        row = data[0] if data else None
+    elif isinstance(data, dict):
+        row = data
+
+    if not row:
         logger.info(
-            "voicebot_call_tokens miss token=%s... (RLS, expired, or not inserted by Moontech)",
-            token[:8],
+            "token_not_found token=%s... (expired, invalid, or RPC returned empty)",
+            raw[:8],
         )
-    if call_tok:
-        expires_at = call_tok.get("expires_at")
-        if expires_at:
-            try:
-                exp = datetime.fromisoformat(str(expires_at).replace("Z", "+00:00"))
-                if exp.tzinfo is None:
-                    exp = exp.replace(tzinfo=timezone.utc)
-                if exp.timestamp() > datetime.now(timezone.utc).timestamp():
-                    agent_id_from_call_token = call_tok.get("agent_id")
-                    overrides = call_tok.get("overrides") or {}
-                    override_script = overrides.get("script")
-                    override_customer_name = overrides.get("customer_name")
-            except (ValueError, TypeError):
-                pass
+        raise SupabaseAgentError("token_not_found", status_code=404)
 
-    def _fetch_agent_by_id(aid: str):
-        return (
-            client.table("ai_agents")
-            .select(AGENT_COLS)
-            .eq("id", aid)
-            .maybe_single()
-            .execute()
-        )
-
-    def _fetch_agent_by_voicebot_token():
-        return (
-            client.table("ai_agents")
-            .select(AGENT_COLS)
-            .eq("voicebot_token", token)
-            .maybe_single()
-            .execute()
-        )
-
-    if agent_id_from_call_token:
-        agent_result = await _run_sync(_fetch_agent_by_id, agent_id_from_call_token)
-    else:
-        agent_result = await _run_sync(_fetch_agent_by_voicebot_token)
-
-    agent = _extract_supabase_data(agent_result)
-    if not agent:
-        raise SupabaseAgentError("agent not found", status_code=404)
-    if agent.get("status") and agent.get("status") != "active":
-        raise SupabaseAgentError("agent inactive", status_code=403)
-
-    base_sys = agent.get("system_prompt") or agent.get("script") or _DEFAULT_SYSTEM_PROMPT
-    base_first = _base_first_message(agent)
-    system_prompt = base_sys
-    first_message = base_first
-    if override_script:
-        system_prompt = base_sys + build_campaign_prompt_suffix(
-            override_script, override_customer_name
-        )
-        first_message = build_campaign_first_message(
-            override_script, base_first, override_customer_name
-        )
-
-    enriched = dict(agent)
-    if not enriched.get("greeting_audio_base64") and not override_script:
-        greeting = await _fetch_greeting_from_moontech(agent["id"])
-        if greeting:
-            enriched = _merge_greeting(enriched, greeting)
-
-    fields = _agent_bundle_fields(enriched)
-    fields["system_prompt"] = system_prompt
-    fields["first_message"] = first_message
-
-    return {
-        "agent_id": agent["id"],
-        "user_id": agent.get("user_id"),
-        "token": agent.get("voicebot_token") or token,
-        **fields,
-        "greeting_audio_base64": enriched.get("greeting_audio_base64"),
-        "greeting_audio_mime": enriched.get("greeting_audio_mime")
-        or (
-            "audio/L16;rate=8000"
-            if enriched.get("greeting_audio_base64")
-            else None
-        ),
-        "greeting_audio_bytes": enriched.get("greeting_audio_bytes"),
-        "greeting_audio_hash": enriched.get("greeting_audio_hash"),
-        "greeting_audio_generated_at": enriched.get("greeting_audio_generated_at"),
-        "greeting": _greeting_object(enriched, first_message),
-        "customer_name": override_customer_name,
-    }
+    logger.info(
+        "get_agent_bundle_by_token ok token=%s... agent_id=%s",
+        raw[:8],
+        row.get("agent_id"),
+    )
+    return _payload_from_inbound_rpc_row(row)
 
 
 async def fetch_greeting_from_moontech(agent_id: str) -> dict[str, Any] | None:

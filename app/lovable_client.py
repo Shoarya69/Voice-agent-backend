@@ -29,7 +29,7 @@ number via `phone_numbers` (voice-inbound, Exotel -> Lovable directly).
 
 Agent-config lookups (read path):
   - Inbound by number: Supabase RPC ``get_inbound_agent_bundle`` (single path)
-  - Outbound by token: Supabase tables (+ Moontech greeting cold-cache when needed)
+  - Outbound by token: Supabase RPC ``get_agent_bundle_by_token`` (Moontech HTTP fallback)
   - Greeting PCM: Moontech HTTP ``agent-with-greeting`` when not cached
 
 The `voice-inbound` telephony hook (Exotel -> Lovable, TwiML) is separate
