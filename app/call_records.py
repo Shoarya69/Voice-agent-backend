@@ -30,6 +30,12 @@ _hangup_enrichment: dict[str, dict[str, Any]] = {}
 _enrichment_lock = asyncio.Lock()
 
 AI_CALLS_TABLE = "ai_calls"
+_supabase_call_writes_blocked = False
+
+
+def _log_phone(value: str | None) -> str:
+    """Lovable call-log API requires strings, not JSON null."""
+    return str(value).strip() if value else ""
 
 
 def iso_z(dt: datetime) -> str:
@@ -119,8 +125,8 @@ def build_call_log_payload(
         or (agent_config.agent_id if agent_config else ""),
         "phone_number_id": getattr(agent_config, "phone_number_id", "") if agent_config else "",
         "provider": getattr(session, "telephony_provider", None) or "exotel",
-        "from_number": getattr(session, "caller_from", None),
-        "to_number": getattr(session, "caller_to", None),
+        "from_number": _log_phone(getattr(session, "caller_from", None)),
+        "to_number": _log_phone(getattr(session, "caller_to", None)),
         "direction": getattr(session, "call_direction", None) or "inbound",
         "duration_seconds": duration_seconds,
         "started_at": iso_z(started_at),
@@ -156,8 +162,8 @@ def _row_from_session_started(session: VoicePipelineSession) -> dict[str, Any]:
         "call_sid": session.call_sid,
         "provider": getattr(session, "telephony_provider", None) or "exotel",
         "direction": getattr(session, "call_direction", None) or "inbound",
-        "from_number": getattr(session, "caller_from", None),
-        "to_number": getattr(session, "caller_to", None),
+        "from_number": _log_phone(getattr(session, "caller_from", None)),
+        "to_number": _log_phone(getattr(session, "caller_to", None)),
         "status": "in_progress",
         "started_at": iso_z(started),
     }
@@ -261,6 +267,10 @@ async def _supabase_upsert(row: dict[str, Any]) -> None:
 
             await run_sync(_insert)
 
+    global _supabase_call_writes_blocked
+    if _supabase_call_writes_blocked:
+        return
+
     try:
         try:
             await _try_upsert()
@@ -277,6 +287,23 @@ async def _supabase_upsert(row: dict[str, Any]) -> None:
             call_sid,
             row.get("provider"),
             row.get("status"),
+        )
+    except supabase_agent_provider.SupabaseAgentError as exc:
+        detail = str(exc).lower()
+        if exc.status_code in (401, 403) or "permission denied" in detail:
+            if not _supabase_call_writes_blocked:
+                _supabase_call_writes_blocked = True
+                logger.warning(
+                    "Supabase ai_calls writes disabled for this process (anon key / RLS). "
+                    "Set SUPABASE_SERVICE_ROLE_KEY on the voice server or "
+                    "ENABLE_SUPABASE_CALL_RECORDS=false. First error: %s",
+                    exc,
+                )
+            return
+        logger.error(
+            "Supabase ai_calls upsert failed call_sid=%s error=%s",
+            call_sid,
+            exc,
         )
     except Exception as exc:
         logger.error(

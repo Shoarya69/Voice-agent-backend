@@ -27,20 +27,45 @@ class VobizStream:
         self.stream_id: str | None = None
         self._lock = asyncio.Lock()
         self.closed = False
+        self._play_bytes_sent = 0
+        self._send_fail_logged = False
+        self._first_play_logged = False
+
+    async def _send_json(self, payload: str) -> None:
+        """``websockets`` uses ``send``; Starlette/FastAPI uses ``send_text``."""
+        ws = self.ws
+        if hasattr(ws, "send_text"):
+            await ws.send_text(payload)
+            return
+        if hasattr(ws, "send"):
+            await ws.send(payload)
+            return
+        raise TypeError(f"Unsupported Vobiz WebSocket type: {type(ws)!r}")
 
     async def _send(self, msg: dict[str, Any]) -> None:
         if self.closed:
             return
         async with self._lock:
             try:
-                await self.ws.send_text(json.dumps(msg))
+                await self._send_json(json.dumps(msg))
             except Exception as exc:
-                logger.debug("Vobiz send failed: %s", exc)
+                if not self._send_fail_logged:
+                    logger.error(
+                        "Vobiz WebSocket send failed (no playAudio to caller): %s",
+                        exc,
+                    )
+                    self._send_fail_logged = True
                 self.closed = True
 
     async def play_ulaw(self, audio: bytes) -> None:
+        if not audio or self.closed:
+            return
+        if not self.stream_id:
+            logger.warning("Vobiz play_ulaw skipped — streamId not set yet")
+            return
         chunk = max(ULAW_FRAME_20MS, config.VOBIZ_ULAW_PLAY_CHUNK)
         for i in range(0, len(audio), chunk):
+            block = audio[i : i + chunk]
             await self._send(
                 {
                     "event": "playAudio",
@@ -48,10 +73,18 @@ class VobizStream:
                     "media": {
                         "contentType": "audio/x-mulaw",
                         "sampleRate": 8000,
-                        "payload": base64.b64encode(audio[i : i + chunk]).decode("ascii"),
+                        "payload": base64.b64encode(block).decode("ascii"),
                     },
                 }
             )
+            self._play_bytes_sent += len(block)
+            if not self._first_play_logged:
+                self._first_play_logged = True
+                logger.info(
+                    "Vobiz playAudio started streamId=%s first_chunk_ulaw_bytes=%s",
+                    self.stream_id,
+                    len(block),
+                )
 
     async def checkpoint(self, name: str) -> None:
         await self._send(
