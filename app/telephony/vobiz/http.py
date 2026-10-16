@@ -78,6 +78,12 @@ async def handle_answer(request: web.Request) -> web.Response:
         logger.error("Vobiz answer misconfigured: %s", exc)
         return web.Response(status=500, text="PUBLIC_HOST not configured")
 
+    logger.info(
+        "Vobiz answer XML ready CallUUID=%s wss_target=%s to=...%s",
+        data.get("CallUUID") or data.get("callUUID"),
+        wss,
+        to_number[-4:] if to_number else "",
+    )
     return web.Response(text=body, content_type="application/xml")
 
 

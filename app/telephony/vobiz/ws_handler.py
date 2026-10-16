@@ -96,6 +96,20 @@ async def handle_vobiz_websocket(websocket) -> None:
         voice_server._log_channel_reserved(session, connection_id)
         start_agent_prefetch(session, connection_id)
 
+        # Load agent before `start` so Vobiz hears playAudio within ~1–2s (not after 6s HTTP).
+        agent_preloaded = False
+        if session.wss_route_kind in ("token", "number") and session.wss_route_value:
+            logger.info(
+                "⏳ Vobiz early agent prefetch conn=%s route=%s",
+                connection_id,
+                session.wss_route_kind,
+            )
+            agent_preloaded = await voice_server._await_agent_prefetch(
+                session, connection_id
+            )
+            if agent_preloaded:
+                voice_server._commit_agent_config_to_session(session)
+
         agent_started = False
 
         async for message in websocket:
@@ -137,9 +151,12 @@ async def handle_vobiz_websocket(websocket) -> None:
                     )
                 voice_server._log_call_started(session, connection_id)
 
-                agent_resolved = await voice_server._resolve_agent_on_start(
-                    session, connection_id, start_data
-                )
+                if agent_preloaded and session.agent_config:
+                    agent_resolved = True
+                else:
+                    agent_resolved = await voice_server._resolve_agent_on_start(
+                        session, connection_id, start_data
+                    )
                 if not agent_resolved:
                     logger.error(
                         "Vobiz agent lookup failed (conn=%s path=%r to=%s)",
@@ -151,7 +168,8 @@ async def handle_vobiz_websocket(websocket) -> None:
                     end_reason = "agent_lookup_failed"
                     break
 
-                voice_server._commit_agent_config_to_session(session)
+                if not agent_preloaded:
+                    voice_server._commit_agent_config_to_session(session)
                 call_records.schedule_call_started(session)
                 await session.on_agent_ready()
                 await session.speak_welcome()

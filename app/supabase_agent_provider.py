@@ -382,6 +382,11 @@ async def fetch_agent_payload_by_token(token: str) -> dict[str, Any]:
 
     call_tok_result = await _run_sync(_fetch_call_token)
     call_tok = _extract_supabase_data(call_tok_result)
+    if not call_tok:
+        logger.info(
+            "voicebot_call_tokens miss token=%s... (RLS, expired, or not inserted by Moontech)",
+            token[:8],
+        )
     if call_tok:
         expires_at = call_tok.get("expires_at")
         if expires_at:
