@@ -79,6 +79,9 @@ VOBIZ_ECHO_GUARD_MS = _get_int("VOBIZ_ECHO_GUARD_MS", 650)
 # Fewer TTS clause splits → smoother, more human prosody on Vobiz
 VOBIZ_STREAMING_CLAUSE_MAX_CHARS = _get_int("VOBIZ_STREAMING_CLAUSE_MAX_CHARS", 52)
 VOBIZ_REPLY_WORD_MAX = _get_int("VOBIZ_REPLY_WORD_MAX", 22)
+# Stop waiting on OpenAI stream if no token this long (avoids hung turn + no TTS flush).
+VOBIZ_LLM_STREAM_IDLE_SEC = _get_float("VOBIZ_LLM_STREAM_IDLE_SEC", 1.25)
+VOBIZ_LLM_STREAM_MAX_SEC = _get_float("VOBIZ_LLM_STREAM_MAX_SEC", 12.0)
 VOBIZ_TTS_KEEPALIVE_SEC = _get_float("VOBIZ_TTS_KEEPALIVE_SEC", 8.0)
 # Prewarm agent bundle on /vobiz/answer (during ring) before media WebSocket connects.
 VOBIZ_PREWARM_ON_ANSWER = _get_bool("VOBIZ_PREWARM_ON_ANSWER", True)

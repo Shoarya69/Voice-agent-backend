@@ -7,12 +7,13 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from typing import Awaitable, Callable
+from typing import AsyncIterator, Awaitable, Callable
 
 import websockets.exceptions
 
 from app import config
 from app.audio_utils import chunk_pcm
+from app.elevenlabs_service import ElevenLabsError, elevenlabs_service
 from app.latency_trace import active_trace
 from app.runtime import tts_semaphore
 from app.streaming.clause_buffer import split_next_clause
@@ -88,73 +89,83 @@ class StreamingTurnRunner:
 
         llm_buffer = ""
         openai_started = False
+        stop_llm = False
 
         try:
             async with tts_semaphore:
-                async for delta in self._providers.llm.stream_reply(llm_messages):
-                    if self._is_cancelled():
-                        break
-                    if not openai_started:
-                        openai_started = True
-                        timeline.mark_once("openai_request_ms")
-                    timeline.mark_once("openai_first_token_ms")
-                    trace = active_trace()
-                    if trace is not None:
-                        trace.record_llm_token()
-
-                    if words_sent >= word_cap:
-                        break
-
-                    llm_buffer += delta
-                    reply_parts.append(delta)
-                    llm_buffer = self._strip_call_end_marker(llm_buffer, should_end_call)
-
-                    while True:
-                        split = split_next_clause(
-                            llm_buffer, max_chars=clause_max_chars
-                        )
-                        if split is None:
+                try:
+                    async for delta in self._stream_llm_deltas(llm_messages):
+                        if self._is_cancelled() or stop_llm:
                             break
-                        clause, llm_buffer = split
-                        if not clause:
-                            break
-                        clause, words_sent = self._trim_clause(
-                            clause, words_sent, word_cap
-                        )
-                        if not clause:
-                            break
-                        if timing["first_clause_ms"] is None:
-                            timing["first_clause_ms"] = round(
-                                (time.perf_counter() - turn_started) * 1000
-                            )
-                            timeline.mark_once("llm_first_sentence_ms")
-                        timeline.mark_once("tts_first_request_ms")
+                        if not openai_started:
+                            openai_started = True
+                            timeline.mark_once("openai_request_ms")
+                        timeline.mark_once("openai_first_token_ms")
                         trace = active_trace()
                         if trace is not None:
-                            trace.record_llm_clause(clause)
-                        await self._providers.tts.send_text(clause)
-                        stats.clauses += 1
+                            trace.record_llm_token()
+
                         if words_sent >= word_cap:
-                            llm_buffer = ""
                             break
 
-                tail = self._strip_call_end_marker(llm_buffer, should_end_call).strip()
-                if tail and words_sent < word_cap:
-                    tail, words_sent = self._trim_clause(tail, words_sent, word_cap)
-                    if tail:
-                        if timing["first_clause_ms"] is None:
-                            timing["first_clause_ms"] = round(
-                                (time.perf_counter() - turn_started) * 1000
-                            )
-                            timeline.mark_once("llm_first_sentence_ms")
-                        timeline.mark_once("tts_first_request_ms")
-                        trace = active_trace()
-                        if trace is not None:
-                            trace.record_llm_clause(tail)
-                        await self._providers.tts.send_text(tail)
-                        stats.clauses += 1
+                        llm_buffer += delta
+                        reply_parts.append(delta)
+                        llm_buffer = self._strip_call_end_marker(
+                            llm_buffer, should_end_call
+                        )
 
-                await self._providers.tts.flush_utterance()
+                        while True:
+                            split = split_next_clause(
+                                llm_buffer, max_chars=clause_max_chars
+                            )
+                            if split is None:
+                                break
+                            clause, llm_buffer = split
+                            if not clause:
+                                break
+                            clause, words_sent = self._trim_clause(
+                                clause, words_sent, word_cap
+                            )
+                            if not clause:
+                                break
+                            if timing["first_clause_ms"] is None:
+                                timing["first_clause_ms"] = round(
+                                    (time.perf_counter() - turn_started) * 1000
+                                )
+                                timeline.mark_once("llm_first_sentence_ms")
+                            timeline.mark_once("tts_first_request_ms")
+                            trace = active_trace()
+                            if trace is not None:
+                                trace.record_llm_clause(clause)
+                            await self._providers.tts.send_text(clause)
+                            stats.clauses += 1
+                            if words_sent >= word_cap:
+                                llm_buffer = ""
+                                stop_llm = True
+                                break
+
+                    tail = self._strip_call_end_marker(
+                        llm_buffer, should_end_call
+                    ).strip()
+                    if tail and words_sent < word_cap and not stop_llm:
+                        tail, words_sent = self._trim_clause(
+                            tail, words_sent, word_cap
+                        )
+                        if tail:
+                            if timing["first_clause_ms"] is None:
+                                timing["first_clause_ms"] = round(
+                                    (time.perf_counter() - turn_started) * 1000
+                                )
+                                timeline.mark_once("llm_first_sentence_ms")
+                            timeline.mark_once("tts_first_request_ms")
+                            trace = active_trace()
+                            if trace is not None:
+                                trace.record_llm_clause(tail)
+                            await self._providers.tts.send_text(tail)
+                            stats.clauses += 1
+                finally:
+                    if stats.clauses > 0:
+                        await self._providers.tts.flush_utterance()
         except BrainError as exc:
             logger.error("Brain error for %s: %s", self._connection_id, exc)
             if not reply_parts:
@@ -164,7 +175,13 @@ class StreamingTurnRunner:
                 reply_parts.append(fallback)
         finally:
             try:
-                await playback_task
+                await asyncio.wait_for(playback_task, timeout=14.0)
+            except asyncio.TimeoutError:
+                playback_task.cancel()
+                logger.warning(
+                    "TTS playback timed out conn=%s",
+                    self._connection_id,
+                )
             except asyncio.CancelledError:
                 pass
             if timing.get("first_byte_ms") is None and reply_parts:
@@ -185,6 +202,8 @@ class StreamingTurnRunner:
                     await self._retry_turn_audio(
                         retry_text, timeline, timing, stats, turn_started
                     )
+                if timing.get("first_byte_ms") is None and retry_text:
+                    await self._play_http_fallback(retry_text, timeline, timing)
 
         reply_text = self._truncate_reply_words(
             self._strip_call_end_marker("".join(reply_parts), should_end_call).strip(),
@@ -196,6 +215,97 @@ class StreamingTurnRunner:
         stats.first_byte_ms = timing.get("first_byte_ms")
         stats.total_ms = round((time.perf_counter() - turn_started) * 1000, 1)
         return reply_text, stats
+
+    async def _stream_llm_deltas(
+        self, llm_messages: list[dict]
+    ) -> AsyncIterator[str]:
+        """Yield LLM tokens; stop on idle/max so TTS flush always runs."""
+        is_vobiz = self._connection_id.startswith("vobiz_")
+        idle_sec = (
+            config.VOBIZ_LLM_STREAM_IDLE_SEC if is_vobiz else 3.0
+        )
+        max_sec = config.VOBIZ_LLM_STREAM_MAX_SEC if is_vobiz else 25.0
+        stream = self._providers.llm.stream_reply(llm_messages)
+        started = time.perf_counter()
+        got_token = False
+        try:
+            while True:
+                if self._is_cancelled():
+                    break
+                if time.perf_counter() - started > max_sec:
+                    logger.info(
+                        "LLM stream max duration conn=%s sec=%.1f",
+                        self._connection_id,
+                        max_sec,
+                    )
+                    break
+                # First token can take ~1.3s; idle cutoff only after speech has started.
+                wait_sec = idle_sec if got_token else max(6.0, idle_sec)
+                try:
+                    delta = await asyncio.wait_for(
+                        stream.__anext__(), timeout=wait_sec
+                    )
+                except asyncio.TimeoutError:
+                    logger.info(
+                        "LLM stream idle stop conn=%s idle_sec=%.2f got_token=%s",
+                        self._connection_id,
+                        wait_sec,
+                        got_token,
+                    )
+                    break
+                except StopAsyncIteration:
+                    break
+                if delta:
+                    got_token = True
+                    yield delta
+        finally:
+            close = getattr(stream, "aclose", None)
+            if close is not None:
+                try:
+                    await close()
+                except Exception:
+                    pass
+
+    async def _play_http_fallback(
+        self,
+        text: str,
+        timeline: TurnTimeline,
+        timing: dict,
+    ) -> None:
+        logger.info(
+            "HTTP TTS fallback conn=%s chars=%s",
+            self._connection_id,
+            len(text),
+        )
+        residual = bytearray()
+        playback_started = False
+        try:
+            async for raw in elevenlabs_service.stream_text_to_speech(text):
+                if self._is_cancelled() or not raw:
+                    continue
+                if timing.get("first_byte_ms") is None:
+                    timing["first_byte_ms"] = round(
+                        (time.perf_counter() - timeline.anchor) * 1000,
+                        1,
+                    )
+                    timeline.mark_once("tts_first_byte_ms")
+                residual.extend(raw)
+                while len(residual) >= config.BYTES_PER_CHUNK:
+                    frame = bytes(residual[: config.BYTES_PER_CHUNK])
+                    del residual[: config.BYTES_PER_CHUNK]
+                    if not await self._send_frame(frame, timeline, playback_started):
+                        return
+                    playback_started = True
+            if residual:
+                for frame in chunk_pcm(bytes(residual)):
+                    if not await self._send_frame(frame, timeline, playback_started):
+                        return
+        except ElevenLabsError as exc:
+            logger.error(
+                "HTTP TTS fallback failed conn=%s: %s",
+                self._connection_id,
+                exc,
+            )
 
     async def _retry_turn_audio(
         self,

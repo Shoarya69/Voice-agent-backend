@@ -384,7 +384,7 @@ class StreamingSessionController:
                 is_cancelled=lambda: self._cancel_turn or session._closed,
             )
             session.is_speaking = True
-            reply_text, stats = await runner.run(
+            turn_coro = runner.run(
                 history=session.history,
                 user_text=user_text,
                 llm_user_text=llm_user_content(session, user_text),
@@ -392,6 +392,23 @@ class StreamingSessionController:
                 turn_started=turn_started,
                 should_end_call=should_end_call,
             )
+            turn_timeout = (
+                config.VOBIZ_LLM_STREAM_MAX_SEC + 8.0
+                if session.connection_id.startswith("vobiz_")
+                else 45.0
+            )
+            try:
+                reply_text, stats = await asyncio.wait_for(
+                    turn_coro, timeout=turn_timeout
+                )
+            except asyncio.TimeoutError:
+                self._cancel_turn = True
+                logger.error(
+                    "Streaming turn timed out conn=%s after %.0fs",
+                    session.connection_id,
+                    turn_timeout,
+                )
+                reply_text, stats = "", None
             session._should_end_call = should_end_call[0]
             session._trim_history()
 

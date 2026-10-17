@@ -206,12 +206,13 @@ class ElevenLabsWebSocketTTSProvider(StreamingTTSProvider):
         except websockets.exceptions.ConnectionClosed:
             self._connected = False
         try:
-            await asyncio.wait_for(self._utterance_done.wait(), timeout=30.0)
+            await asyncio.wait_for(self._utterance_done.wait(), timeout=8.0)
         except asyncio.TimeoutError:
             logger.warning(
-                "TTS utterance flush timed out conn=%s",
+                "TTS utterance flush timed out conn=%s — forcing utterance complete",
                 self._connection_id,
             )
+            self._utterance_done.set()
         finally:
             from app.latency_trace import active_trace
 
@@ -317,6 +318,12 @@ class ElevenLabsWebSocketTTSProvider(StreamingTTSProvider):
                     data = json.loads(raw)
                 except json.JSONDecodeError:
                     continue
+                if data.get("error") or data.get("message"):
+                    logger.error(
+                        "ElevenLabs TTS websocket error conn=%s payload=%s",
+                        self._connection_id,
+                        data,
+                    )
                 audio_b64 = data.get("audio")
                 if audio_b64:
                     pcm = base64.b64decode(audio_b64)
