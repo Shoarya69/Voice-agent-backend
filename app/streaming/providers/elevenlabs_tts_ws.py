@@ -112,8 +112,10 @@ class ElevenLabsWebSocketTTSProvider(StreamingTTSProvider):
         self._utterance_done.clear()
         self._flush_sent = False
         if not self._connected or self._ws is None:
+            was_up = self._connected
             await self._open_socket()
-            self._reconnects += 1
+            if was_up or self._reconnects:
+                self._reconnects += 1
         self._utterance_open = True
 
     async def send_text(self, text: str) -> None:

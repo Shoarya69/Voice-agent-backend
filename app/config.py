@@ -63,8 +63,12 @@ PREWARM_ON_EXOTEL_STATUS = _get_bool("PREWARM_ON_EXOTEL_STATUS", True)
 PUBLIC_HOST = os.getenv("PUBLIC_HOST", "").strip()
 VOBIZ_WS_PATH = os.getenv("VOBIZ_WS_PATH", "/ws").strip() or "/ws"
 VOBIZ_ENABLED = _get_bool("VOBIZ_ENABLED", True)
-# μ-law playAudio chunk size (40 ms @ 8 kHz = 320 bytes)
-VOBIZ_ULAW_PLAY_CHUNK = _get_int("VOBIZ_ULAW_PLAY_CHUNK", 320)
+# μ-law playAudio chunk (160 = 20 ms @ 8 kHz — lower time-to-first-audio than 320)
+VOBIZ_ULAW_PLAY_CHUNK = _get_int("VOBIZ_ULAW_PLAY_CHUNK", 160)
+# Skip Exotel-style 20 ms pacing on Vobiz (reduces gaps / robotic feel)
+VOBIZ_SKIP_PLAYBACK_PACING = _get_bool("VOBIZ_SKIP_PLAYBACK_PACING", True)
+# Greeting: first sentence only so live TTS starts within ~1 s
+VOBIZ_GREETING_FIRST_SENTENCE = _get_bool("VOBIZ_GREETING_FIRST_SENTENCE", True)
 
 # Persist call rows to Supabase ai_calls (in addition to Lovable call-log POST).
 ENABLE_SUPABASE_CALL_RECORDS = _get_bool("ENABLE_SUPABASE_CALL_RECORDS", True)
@@ -189,11 +193,11 @@ STREAMING_STT_ENDPOINTING_MS = _get_int("STREAMING_STT_ENDPOINTING_MS", 450)
 STREAMING_TTS_WS_INACTIVITY_TIMEOUT = _get_int("STREAMING_TTS_WS_INACTIVITY_TIMEOUT", 180)
 STREAMING_TTS_CHUNK_SCHEDULE = [
     int(x.strip())
-    for x in os.getenv("STREAMING_TTS_CHUNK_SCHEDULE", "120,160,250,290").split(",")
+    for x in os.getenv("STREAMING_TTS_CHUNK_SCHEDULE", "50,80,120,160").split(",")
     if x.strip().isdigit()
-] or [120, 160, 250, 290]
-STREAMING_CLAUSE_MIN_WORDS = _get_int("STREAMING_CLAUSE_MIN_WORDS", 3)
-STREAMING_CLAUSE_MAX_CHARS = _get_int("STREAMING_CLAUSE_MAX_CHARS", 48)
+] or [50, 80, 120, 160]
+STREAMING_CLAUSE_MIN_WORDS = _get_int("STREAMING_CLAUSE_MIN_WORDS", 2)
+STREAMING_CLAUSE_MAX_CHARS = _get_int("STREAMING_CLAUSE_MAX_CHARS", 36)
 TURN_MONITOR_INTERVAL_MS = _get_int("TURN_MONITOR_INTERVAL_MS", 25)
 # Pre-generated greeting PCM cap (8kHz slin). Moontech sometimes returns 15–20s clips.
 MAX_GREETING_AUDIO_MS = _get_int("MAX_GREETING_AUDIO_MS", 8000)

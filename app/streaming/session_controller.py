@@ -35,6 +35,7 @@ class StreamingSessionController:
         self._providers: StreamingProviders | None = None
         self._stt_task: asyncio.Task | None = None
         self._connected = False
+        self._tts_ready = False
         self._connect_lock = asyncio.Lock()
         self._turn_in_progress = False
         self._cancel_turn = False
@@ -43,15 +44,28 @@ class StreamingSessionController:
     def enabled(self) -> bool:
         return config.STREAMING_PIPELINE
 
-    async def ensure_connected(self) -> None:
-        if not self.enabled or self._connected:
+    async def ensure_tts_for_greeting(self) -> None:
+        """Open persistent TTS websocket only (fast path before first playAudio)."""
+        if not self.enabled:
             return
         async with self._connect_lock:
-            if self._connected:
+            if self._providers is None:
+                self._providers = build_streaming_providers(self._session.connection_id)
+            tts = self._providers.tts
+            if not getattr(tts, "_connected", False):
+                await tts.connect()
+            self._tts_ready = True
+
+    async def ensure_stt_if_needed(self) -> None:
+        if not self.enabled:
+            return
+        if self._stt_task is not None and not self._stt_task.done():
+            return
+        async with self._connect_lock:
+            if self._providers is None:
+                self._providers = build_streaming_providers(self._session.connection_id)
+            if self._stt_task is not None:
                 return
-            self._providers = build_streaming_providers(self._session.connection_id)
-            # TTS first so Vobiz/exotel callers hear greeting even if STT auth is misconfigured.
-            await self._providers.tts.connect()
             try:
                 async with stt_semaphore:
                     await self._providers.stt.connect()
@@ -62,6 +76,18 @@ class StreamingSessionController:
                     self._session.connection_id,
                     exc,
                 )
+            self._connected = True
+
+    async def ensure_connected(self) -> None:
+        if not self.enabled:
+            return
+        if self._connected:
+            await self.ensure_tts_for_greeting()
+            await self.ensure_stt_if_needed()
+            return
+        await self.ensure_tts_for_greeting()
+        await self.ensure_stt_if_needed()
+        if self._tts_ready:
             self._connected = True
             logger.info(
                 "Streaming pipeline ready conn=%s stt=%s model=%s tts=%s",
@@ -163,6 +189,9 @@ class StreamingSessionController:
                     playback_started = True
         finally:
             self._session.is_speaking = False
+            flush_out = getattr(self._session, "flush_playback_output", None)
+            if flush_out is not None:
+                await flush_out()
             self._session._arm_echo_guard()
             timeline.emit()
             await self.refresh_stt_after_playback()
@@ -326,6 +355,9 @@ class StreamingSessionController:
         finally:
             set_active_trace(trace_token)
             session.is_speaking = False
+            flush_out = getattr(session, "flush_playback_output", None)
+            if flush_out is not None:
+                await flush_out()
             session._arm_echo_guard()
             self._turn_in_progress = False
             self._cancel_turn = False
