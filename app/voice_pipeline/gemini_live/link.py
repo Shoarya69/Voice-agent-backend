@@ -44,6 +44,7 @@ class GeminiLiveLink:
         self._ws = None
         self._reader: asyncio.Task | None = None
         self._setup_done = asyncio.Event()
+        self._setup_ok = False
         self._turn_done = asyncio.Event()
         self._turn_done.set()
         self._closed = False
@@ -73,15 +74,13 @@ class GeminiLiveLink:
             {
                 "setup": {
                     "model": f"models/{config.GEMINI_LIVE_MODEL}",
-                    "generationConfig": {
-                        "responseModalities": ["AUDIO"],
-                        "speechConfig": {
-                            "voiceConfig": {
-                                "prebuiltVoiceConfig": {
-                                    "voiceName": config.GEMINI_LIVE_VOICE,
-                                }
+                    "responseModalities": ["AUDIO"],
+                    "speechConfig": {
+                        "voiceConfig": {
+                            "prebuiltVoiceConfig": {
+                                "voiceName": config.GEMINI_LIVE_VOICE,
                             }
-                        },
+                        }
                     },
                     "systemInstruction": {
                         "parts": [{"text": instructions}],
@@ -97,6 +96,11 @@ class GeminiLiveLink:
             }
         )
         await asyncio.wait_for(self._setup_done.wait(), timeout=8.0)
+        if not self._setup_ok or self._ws is None:
+            raise RuntimeError(
+                "Gemini Live setup rejected "
+                f"(model={config.GEMINI_LIVE_MODEL}). Check GEMINI_API_KEY and GEMINI_LIVE_MODEL."
+            )
         logger.info(
             "Gemini Live ready conn=%s model=%s voice=%s",
             self._connection_id,
@@ -177,8 +181,13 @@ class GeminiLiveLink:
                 await self._handle(message)
         except asyncio.CancelledError:
             raise
-        except websockets.exceptions.ConnectionClosed:
-            logger.info("Gemini Live socket closed conn=%s", self._connection_id)
+        except websockets.exceptions.ConnectionClosed as exc:
+            logger.error(
+                "Gemini Live socket closed conn=%s code=%s reason=%s",
+                self._connection_id,
+                getattr(exc, "code", None),
+                getattr(exc, "reason", None),
+            )
         except Exception as exc:
             logger.error("Gemini Live reader failed conn=%s: %s", self._connection_id, exc)
         finally:
@@ -187,7 +196,15 @@ class GeminiLiveLink:
 
     async def _handle(self, message: dict) -> None:
         if "setupComplete" in message:
+            self._setup_ok = True
             self._setup_done.set()
+            return
+        if "error" in message:
+            logger.error(
+                "Gemini Live error conn=%s payload=%s",
+                self._connection_id,
+                message,
+            )
             return
         if "goAway" in message:
             logger.warning("Gemini Live goAway conn=%s", self._connection_id)

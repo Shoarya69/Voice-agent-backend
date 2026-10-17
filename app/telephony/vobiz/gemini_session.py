@@ -58,7 +58,15 @@ class VobizGeminiLiveSession(VobizCompoundSession):
         welcome = self._welcome_text()
         if not welcome.strip():
             return
-        await self._ensure_link()
+        try:
+            await self._ensure_link()
+        except Exception as exc:
+            logger.error(
+                "Gemini Live connect failed conn=%s: %s",
+                self.connection_id,
+                exc,
+            )
+            return
         self.history.append({"role": "assistant", "content": welcome})
         self._is_playing_welcome = True
         try:

@@ -125,7 +125,7 @@ VOICE_PIPELINE = os.getenv("VOICE_PIPELINE", "compound").strip().lower()
 # Gemini Live (only when VOICE_PIPELINE=gemini_live)
 GEMINI_API_KEY = (os.getenv("GEMINI_API_KEY", "") or os.getenv("GOOGLE_API_KEY", "")).strip()
 GEMINI_LIVE_MODEL = os.getenv(
-    "GEMINI_LIVE_MODEL", "gemini-live-2.5-flash-native-audio"
+    "GEMINI_LIVE_MODEL", "gemini-3.8-live"
 ).strip()
 GEMINI_LIVE_VOICE = os.getenv("GEMINI_LIVE_VOICE", "Kore").strip()
 GEMINI_LIVE_WS_URL = os.getenv(
