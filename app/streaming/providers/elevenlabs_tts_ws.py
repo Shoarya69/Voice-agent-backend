@@ -114,6 +114,17 @@ class ElevenLabsWebSocketTTSProvider(StreamingTTSProvider):
                 self._reconnects,
             )
 
+    def _prepare_for_reuse(self) -> None:
+        """Reset utterance state when returning an open socket to the warm pool."""
+        while not self._utterance_audio.empty():
+            try:
+                self._utterance_audio.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+        self._utterance_done.set()
+        self._utterance_open = False
+        self._flush_sent = False
+
     async def begin_utterance(self) -> None:
         if self._closed:
             return

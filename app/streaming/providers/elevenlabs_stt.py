@@ -54,6 +54,22 @@ class ElevenLabsStreamingSTTProvider(StreamingSTTProvider):
     async def connect(self) -> None:
         await self._open_connection()
 
+    async def wait_session_ready(self, timeout: float = 8.0) -> bool:
+        try:
+            await asyncio.wait_for(self._session_started.wait(), timeout=timeout)
+            return True
+        except asyncio.TimeoutError:
+            return False
+
+    def _prepare_for_reuse(self) -> None:
+        while not self._event_queue.empty():
+            try:
+                self._event_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+        self._chunks_sent = 0
+        self._closed = False
+
     async def ensure_live(self) -> None:
         """Reconnect if the STT websocket died (e.g. idle during long greeting TTS)."""
         if self._closed:

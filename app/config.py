@@ -85,6 +85,9 @@ VOBIZ_PREWARM_ON_ANSWER = _get_bool("VOBIZ_PREWARM_ON_ANSWER", True)
 # Keep ElevenLabs TTS TLS/WS hot between calls (startup + periodic refresh).
 VOBIZ_WARM_POOL_ENABLED = _get_bool("VOBIZ_WARM_POOL_ENABLED", True)
 VOBIZ_WARM_POOL_REFRESH_SEC = _get_int("VOBIZ_WARM_POOL_REFRESH_SEC", 180)
+# Idle ElevenLabs websockets at boot; calls borrow/return (no .env agent ids).
+VOBIZ_TTS_POOL_SIZE = _get_int("VOBIZ_TTS_POOL_SIZE", 2)
+VOBIZ_STT_POOL_SIZE = _get_int("VOBIZ_STT_POOL_SIZE", 2)
 
 # Persist call rows to Supabase ai_calls (in addition to Lovable call-log POST).
 ENABLE_SUPABASE_CALL_RECORDS = _get_bool("ENABLE_SUPABASE_CALL_RECORDS", True)

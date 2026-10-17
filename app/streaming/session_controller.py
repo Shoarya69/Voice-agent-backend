@@ -20,6 +20,9 @@ from app.latency_trace import (
 from app.runtime import stt_semaphore
 from app.streaming.factory import StreamingProviders, build_streaming_providers
 from app.streaming.providers.base import STTEventKind
+from app.streaming import warm_pool
+from app.streaming.providers.elevenlabs_stt import ElevenLabsStreamingSTTProvider
+from app.streaming.providers.elevenlabs_tts_ws import ElevenLabsWebSocketTTSProvider
 from app.streaming.turn_runner import StreamingTurnRunner
 from app.telephony.vobiz.conversation import (
     arm_stt_gate_after_bot_spoke,
@@ -59,7 +62,11 @@ class StreamingSessionController:
             if self._providers is None:
                 self._providers = build_streaming_providers(self._session.connection_id)
             tts = self._providers.tts
-            if not getattr(tts, "_connected", False):
+            borrowed = await warm_pool.borrow_tts(self._session.connection_id)
+            if borrowed is not None:
+                self._providers.tts = borrowed
+                tts = borrowed
+            elif not getattr(tts, "_connected", False):
                 await tts.connect()
             self._tts_ready = True
 
@@ -74,8 +81,14 @@ class StreamingSessionController:
             if self._stt_task is not None:
                 return
             try:
+                stt = self._providers.stt
+                borrowed = await warm_pool.borrow_stt(self._session.connection_id)
+                if borrowed is not None:
+                    self._providers.stt = borrowed
+                    stt = borrowed
                 async with stt_semaphore:
-                    await self._providers.stt.connect()
+                    if borrowed is None:
+                        await stt.connect()
                 self._stt_task = asyncio.create_task(self._stt_event_loop())
             except Exception as exc:
                 logger.error(
@@ -155,8 +168,16 @@ class StreamingSessionController:
             except asyncio.CancelledError:
                 pass
         if self._providers is not None:
-            await self._providers.stt.close()
-            await self._providers.tts.close()
+            stt = self._providers.stt
+            if isinstance(stt, ElevenLabsStreamingSTTProvider):
+                await warm_pool.release_stt(stt)
+            else:
+                await stt.close()
+            tts = self._providers.tts
+            if isinstance(tts, ElevenLabsWebSocketTTSProvider):
+                await warm_pool.release_tts(tts)
+            else:
+                await tts.close()
             self._providers = None
         self._connected = False
 
