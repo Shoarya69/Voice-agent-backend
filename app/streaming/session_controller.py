@@ -55,10 +55,12 @@ class StreamingSessionController:
         return config.STREAMING_PIPELINE
 
     async def ensure_tts_for_greeting(self) -> None:
-        """Open persistent TTS websocket only (fast path before first playAudio)."""
-        if not self.enabled:
+        """Open one TTS websocket for the greeting. Never borrow again on later audio."""
+        if not self.enabled or self._tts_ready:
             return
         async with self._connect_lock:
+            if self._tts_ready:
+                return
             if self._providers is None:
                 self._providers = build_streaming_providers(self._session.connection_id)
             tts = self._providers.tts
@@ -116,7 +118,6 @@ class StreamingSessionController:
         if not self.enabled:
             return
         if self._connected:
-            await self.ensure_tts_for_greeting()
             await self.ensure_stt_if_needed()
             return
         await self.ensure_tts_for_greeting()

@@ -182,29 +182,12 @@ async def _top_up_stt_pool() -> None:
 
 
 async def release_tts(provider: ElevenLabsWebSocketTTSProvider) -> None:
-    if config.VOBIZ_TTS_POOL_SIZE <= 0 or provider._closed:
-        try:
-            await provider.close()
-        except Exception:
-            pass
-        return
-    if not getattr(provider, "_connected", False) or provider._ws is None:
-        try:
-            await provider.close()
-        except Exception:
-            pass
-        asyncio.create_task(_top_up_tts_pool())
-        return
-    provider._connection_id = f"_tts_pool_{_tts_pool.qsize()}_"
-    provider._prepare_for_reuse()
-    async with _pool_lock:
-        if _tts_pool.qsize() < config.VOBIZ_TTS_POOL_SIZE:
-            await _tts_pool.put(provider)
-            return
+    """Close the call socket. A fresh pool socket is opened so idle streams don't time out."""
     try:
         await provider.close()
     except Exception:
         pass
+    asyncio.create_task(_top_up_tts_pool())
 
 
 async def release_stt(provider: ElevenLabsStreamingSTTProvider) -> None:

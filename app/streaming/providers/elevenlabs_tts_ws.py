@@ -121,6 +121,7 @@ class ElevenLabsWebSocketTTSProvider(StreamingTTSProvider):
         self._connected = True
         self._utterance_open = False
         self._voice_id = config.ELEVENLABS_VOICE_ID
+        self._utterance_done.set()
         self._reader_task = asyncio.create_task(self._read_loop())
         if self._keepalive_task is None or self._keepalive_task.done():
             self._keepalive_task = asyncio.create_task(self._keepalive_loop())
@@ -252,14 +253,18 @@ class ElevenLabsWebSocketTTSProvider(StreamingTTSProvider):
         self._closed = True
         if self._keepalive_task is not None:
             self._keepalive_task.cancel()
-        if self._reader_task is not None:
-            self._reader_task.cancel()
         if self._ws is not None:
+            try:
+                await self._ws.send(json.dumps({"text": ""}))
+            except Exception:
+                pass
             try:
                 await self._ws.close()
             except Exception:
                 pass
             self._ws = None
+        if self._reader_task is not None:
+            self._reader_task.cancel()
         await self._utterance_audio.put(None)
 
     @property
@@ -319,12 +324,17 @@ class ElevenLabsWebSocketTTSProvider(StreamingTTSProvider):
                     data = json.loads(raw)
                 except json.JSONDecodeError:
                     continue
-                if data.get("error") or data.get("message"):
+                if data.get("error") or (
+                    data.get("message") and not data.get("audio") and not data.get("isFinal")
+                ):
                     logger.error(
                         "ElevenLabs TTS websocket error conn=%s payload=%s",
                         self._connection_id,
                         data,
                     )
+                    self._connected = False
+                    self._utterance_done.set()
+                    break
                 audio_b64 = data.get("audio")
                 if audio_b64:
                     pcm = base64.b64decode(audio_b64)
