@@ -35,6 +35,7 @@ class VobizGeminiLiveSession(VobizCompoundSession):
             on_audio=self._on_model_audio,
             on_transcript=self._on_transcript,
             on_interrupt=self._on_interrupt,
+            on_turn_complete=self._on_turn_complete,
         )
 
     async def on_agent_ready(self) -> None:
@@ -116,6 +117,14 @@ class VobizGeminiLiveSession(VobizCompoundSession):
                 return
         self._append_history_message(role, cleaned)
         logger.info("Gemini Live %s (%s): %s", role, self.connection_id, cleaned[:160])
+
+    async def _on_turn_complete(self) -> None:
+        if self._out_residual:
+            await self._send_paced_frame(bytes(self._out_residual))
+            self._out_residual.clear()
+        await self.flush_playback_output()
+        self.is_speaking = False
+        self._arm_echo_guard()
 
     async def _on_interrupt(self) -> None:
         self._out_residual.clear()

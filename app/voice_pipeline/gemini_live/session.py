@@ -36,6 +36,7 @@ class GeminiLivePipelineSession(VoicePipelineSession):
             on_audio=self._on_model_audio,
             on_transcript=self._on_transcript,
             on_interrupt=self._on_interrupt,
+            on_turn_complete=self._on_turn_complete,
         )
 
     async def on_agent_ready(self) -> None:
@@ -106,6 +107,12 @@ class GeminiLivePipelineSession(VoicePipelineSession):
         logger.info("Gemini Live %s (%s): %s", role, self.connection_id, cleaned[:160])
         if role == "assistant":
             self._schedule_close_after_playback_if_needed()
+
+    async def _on_turn_complete(self) -> None:
+        if self._out_residual:
+            await self.send_pcm_frame(bytes(self._out_residual))
+            self._out_residual.clear()
+        self.is_speaking = False
 
     async def _on_interrupt(self) -> None:
         self._out_residual.clear()
