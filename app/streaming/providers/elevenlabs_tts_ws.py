@@ -90,10 +90,10 @@ class ElevenLabsWebSocketTTSProvider(StreamingTTSProvider):
                 {
                     "text": " ",
                     "voice_settings": {
-                        "stability": 0.5,
-                        "similarity_boost": 0.75,
-                        "style": 0.0,
-                        "use_speaker_boost": True,
+                        "stability": config.ELEVENLABS_TTS_STABILITY,
+                        "similarity_boost": config.ELEVENLABS_TTS_SIMILARITY,
+                        "style": config.ELEVENLABS_TTS_STYLE,
+                        "use_speaker_boost": config.ELEVENLABS_TTS_SPEAKER_BOOST,
                     },
                     "generation_config": {
                         "chunk_length_schedule": config.STREAMING_TTS_CHUNK_SCHEDULE,
@@ -235,10 +235,15 @@ class ElevenLabsWebSocketTTSProvider(StreamingTTSProvider):
         assert self._ws is not None
         await self._ws.send(json.dumps({"text": text}))
 
+    def _keepalive_interval_sec(self) -> float:
+        if self._connection_id.startswith("vobiz_"):
+            return max(5.0, config.VOBIZ_TTS_KEEPALIVE_SEC)
+        return 15.0
+
     async def _keepalive_loop(self) -> None:
         try:
             while not self._closed:
-                await asyncio.sleep(15)
+                await asyncio.sleep(self._keepalive_interval_sec())
                 if self._closed or self._ws is None or self._utterance_open:
                     continue
                 try:

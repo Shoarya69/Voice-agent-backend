@@ -41,6 +41,7 @@ class VobizCompoundSession(CompoundPipelineSession):
         self._last_bot_spoke_at = 0.0
         self._last_spoken_reply = ""
         self._queued_stt_text: str | None = None
+        self._time_check_asked = False
 
     async def add_audio_chunk(self, media_data: dict) -> None:
         payload = media_data.get("payload", "")

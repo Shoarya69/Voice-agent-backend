@@ -8,6 +8,8 @@ import re
 from app import config
 
 # Short backchannels / echo that STT fires while the caller waits for the bot.
+_TIME_CHECK = re.compile(r"(?:2|do|two)\s*minute", re.IGNORECASE)
+
 _FILLER_ONLY = re.compile(
     r"^(?:"
     r"hello+|hi+|hey+|hiya|"
@@ -66,21 +68,32 @@ def should_ignore_committed(session, text: str) -> str | None:
     return None
 
 
+def note_assistant_reply(session, reply: str) -> None:
+    if getattr(session, "telephony_provider", "") != "vobiz":
+        return
+    if _TIME_CHECK.search(reply or ""):
+        session._time_check_asked = True
+
+
 def llm_user_content(session, user_text: str) -> str:
-    """Steer the model away from repeating the same sales line on hello/echo."""
+    """Steer the model: natural phone tone, no scripted repeats."""
     if getattr(session, "telephony_provider", "") != "vobiz":
         return user_text
-    prev = (getattr(session, "_last_spoken_reply", "") or "").strip()
-    if not prev:
+    notes: list[str] = []
+    if getattr(session, "_time_check_asked", False):
+        notes.append(
+            "You already asked if they have 2 minutes — do not ask again; move the conversation forward."
+        )
+    if is_filler_transcript(user_text):
+        notes.append(
+            "Caller is only checking the line. One brief different sentence, then continue — "
+            "never repeat your last line word-for-word."
+        )
+    elif len(user_text.split()) <= 6:
+        notes.append("Reply in one short spoken sentence, friendly and natural.")
+    if not notes:
         return user_text
-    if not is_filler_transcript(user_text):
-        return user_text
-    return (
-        f"{user_text.strip()}\n\n"
-        "(Caller is only checking the line or saying hello again. "
-        "Do NOT repeat your previous sentence verbatim. "
-        "Use one short, different line — confirm they can hear you, then continue.)"
-    )
+    return f"{user_text.strip()}\n\n(" + " ".join(notes) + ")"
 
 
 def is_duplicate_assistant_reply(session, reply: str) -> bool:

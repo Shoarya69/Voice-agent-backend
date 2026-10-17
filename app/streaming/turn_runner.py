@@ -66,6 +66,16 @@ class StreamingTurnRunner:
         stats = TTSStats()
         reply_parts: list[str] = []
         words_sent = 0
+        word_cap = (
+            config.VOBIZ_REPLY_WORD_MAX
+            if self._connection_id.startswith("vobiz_")
+            else config.REPLY_WORD_MAX
+        )
+        clause_max_chars = (
+            config.VOBIZ_STREAMING_CLAUSE_MAX_CHARS
+            if self._connection_id.startswith("vobiz_")
+            else None
+        )
 
         await self._providers.tts.begin_utterance()
         if hasattr(self._providers.tts, "reconnect_count"):
@@ -91,7 +101,7 @@ class StreamingTurnRunner:
                     if trace is not None:
                         trace.record_llm_token()
 
-                    if words_sent >= config.REPLY_WORD_MAX:
+                    if words_sent >= word_cap:
                         break
 
                     llm_buffer += delta
@@ -99,13 +109,17 @@ class StreamingTurnRunner:
                     llm_buffer = self._strip_call_end_marker(llm_buffer, should_end_call)
 
                     while True:
-                        split = split_next_clause(llm_buffer)
+                        split = split_next_clause(
+                            llm_buffer, max_chars=clause_max_chars
+                        )
                         if split is None:
                             break
                         clause, llm_buffer = split
                         if not clause:
                             break
-                        clause, words_sent = self._trim_clause(clause, words_sent)
+                        clause, words_sent = self._trim_clause(
+                            clause, words_sent, word_cap
+                        )
                         if not clause:
                             break
                         if timing["first_clause_ms"] is None:
@@ -119,13 +133,13 @@ class StreamingTurnRunner:
                             trace.record_llm_clause(clause)
                         await self._providers.tts.send_text(clause)
                         stats.clauses += 1
-                        if words_sent >= config.REPLY_WORD_MAX:
+                        if words_sent >= word_cap:
                             llm_buffer = ""
                             break
 
                 tail = self._strip_call_end_marker(llm_buffer, should_end_call).strip()
-                if tail and words_sent < config.REPLY_WORD_MAX:
-                    tail, words_sent = self._trim_clause(tail, words_sent)
+                if tail and words_sent < word_cap:
+                    tail, words_sent = self._trim_clause(tail, words_sent, word_cap)
                     if tail:
                         if timing["first_clause_ms"] is None:
                             timing["first_clause_ms"] = round(
@@ -161,7 +175,7 @@ class StreamingTurnRunner:
 
         reply_text = self._truncate_reply_words(
             self._strip_call_end_marker("".join(reply_parts), should_end_call).strip(),
-            config.REPLY_WORD_MAX,
+            word_cap,
         )
         if reply_text:
             history.append({"role": "assistant", "content": reply_text})
@@ -228,8 +242,11 @@ class StreamingTurnRunner:
             return text.strip()
         return " ".join(words[:max_words]).strip()
 
-    def _trim_clause(self, clause: str, words_sent: int) -> tuple[str, int]:
-        remaining = config.REPLY_WORD_MAX - words_sent
+    def _trim_clause(
+        self, clause: str, words_sent: int, word_cap: int | None = None
+    ) -> tuple[str, int]:
+        cap = word_cap if word_cap is not None else config.REPLY_WORD_MAX
+        remaining = cap - words_sent
         if remaining <= 0:
             return "", words_sent
         trimmed = self._truncate_reply_words(clause, remaining)

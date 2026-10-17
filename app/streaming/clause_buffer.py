@@ -5,7 +5,11 @@ from __future__ import annotations
 from app import config
 
 
-def split_next_clause(buffer: str) -> tuple[str, str] | None:
+def split_next_clause(
+    buffer: str,
+    *,
+    max_chars: int | None = None,
+) -> tuple[str, str] | None:
     """
     Return (clause, remainder) when enough text exists to start TTS.
 
@@ -14,7 +18,7 @@ def split_next_clause(buffer: str) -> tuple[str, str] | None:
     """
     boundary_chars = ",.;!?।\n"
     min_words = max(1, config.STREAMING_CLAUSE_MIN_WORDS)
-    max_chars = max(16, config.STREAMING_CLAUSE_MAX_CHARS)
+    max_chars = max(16, max_chars or config.STREAMING_CLAUSE_MAX_CHARS)
 
     for i, ch in enumerate(buffer):
         if ch in boundary_chars and i >= 2:

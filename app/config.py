@@ -76,6 +76,10 @@ VOBIZ_STT_GATE = _get_bool("VOBIZ_STT_GATE", True)
 VOBIZ_STT_COOLDOWN_MS = _get_int("VOBIZ_STT_COOLDOWN_MS", 1100)
 VOBIZ_SKIP_DUPLICATE_REPLIES = _get_bool("VOBIZ_SKIP_DUPLICATE_REPLIES", True)
 VOBIZ_ECHO_GUARD_MS = _get_int("VOBIZ_ECHO_GUARD_MS", 650)
+# Fewer TTS clause splits → smoother, more human prosody on Vobiz
+VOBIZ_STREAMING_CLAUSE_MAX_CHARS = _get_int("VOBIZ_STREAMING_CLAUSE_MAX_CHARS", 52)
+VOBIZ_REPLY_WORD_MAX = _get_int("VOBIZ_REPLY_WORD_MAX", 22)
+VOBIZ_TTS_KEEPALIVE_SEC = _get_float("VOBIZ_TTS_KEEPALIVE_SEC", 8.0)
 
 # Persist call rows to Supabase ai_calls (in addition to Lovable call-log POST).
 ENABLE_SUPABASE_CALL_RECORDS = _get_bool("ENABLE_SUPABASE_CALL_RECORDS", True)
@@ -182,6 +186,11 @@ ELEVENLABS_STT_MODEL = os.getenv("ELEVENLABS_STT_MODEL", "scribe_v1")
 # optional ISO code, blank = auto-detect
 _ELEVENLABS_STT_LANGUAGE_DEFAULT = os.getenv("ELEVENLABS_STT_LANGUAGE", "")
 ELEVENLABS_BASE_URL = os.getenv("ELEVENLABS_BASE_URL", "https://api.elevenlabs.io")
+# TTS expressiveness (lower stability = more natural variation on calls)
+ELEVENLABS_TTS_STABILITY = _get_float("ELEVENLABS_TTS_STABILITY", 0.38)
+ELEVENLABS_TTS_SIMILARITY = _get_float("ELEVENLABS_TTS_SIMILARITY_BOOST", 0.82)
+ELEVENLABS_TTS_STYLE = _get_float("ELEVENLABS_TTS_STYLE", 0.32)
+ELEVENLABS_TTS_SPEAKER_BOOST = _get_bool("ELEVENLABS_TTS_USE_SPEAKER_BOOST", True)
 
 # ---------------------------------------------------------------------------
 # Low-latency streaming pipeline (compound production default)

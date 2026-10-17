@@ -24,6 +24,7 @@ from app.streaming.turn_runner import StreamingTurnRunner
 from app.telephony.vobiz.conversation import (
     arm_stt_gate_after_bot_spoke,
     llm_user_content,
+    note_assistant_reply,
     should_ignore_committed,
     stt_gate_open,
 )
@@ -369,6 +370,7 @@ class StreamingSessionController:
                 return
 
             session._last_spoken_reply = reply_text
+            note_assistant_reply(session, reply_text)
             logger.info("🧠 Assistant (%s) reply: %s", session.connection_id, reply_text)
             turn_total_ms = (time.perf_counter() - turn_started) * 1000
             timeline.sentences = stats.clauses

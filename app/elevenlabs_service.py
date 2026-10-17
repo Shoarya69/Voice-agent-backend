@@ -143,10 +143,10 @@ class ElevenLabsService:
                     "text": text,
                     "model_id": config.ELEVENLABS_TTS_MODEL,
                     "voice_settings": {
-                        "stability": 0.5,
-                        "similarity_boost": 0.75,
-                        "style": 0.0,
-                        "use_speaker_boost": True,
+                        "stability": config.ELEVENLABS_TTS_STABILITY,
+                        "similarity_boost": config.ELEVENLABS_TTS_SIMILARITY,
+                        "style": config.ELEVENLABS_TTS_STYLE,
+                        "use_speaker_boost": config.ELEVENLABS_TTS_SPEAKER_BOOST,
                     },
                 },
             ) as response:
