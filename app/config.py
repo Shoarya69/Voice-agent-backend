@@ -66,7 +66,7 @@ VOBIZ_ENABLED = _get_bool("VOBIZ_ENABLED", True)
 # μ-law playAudio chunk (160 = 20 ms @ 8 kHz — lower time-to-first-audio than 320)
 VOBIZ_ULAW_PLAY_CHUNK = _get_int("VOBIZ_ULAW_PLAY_CHUNK", 160)
 # Skip Exotel-style 20 ms pacing on Vobiz (reduces gaps / robotic feel)
-VOBIZ_SKIP_PLAYBACK_PACING = _get_bool("VOBIZ_SKIP_PLAYBACK_PACING", True)
+VOBIZ_SKIP_PLAYBACK_PACING = _get_bool("VOBIZ_SKIP_PLAYBACK_PACING", False)
 # Greeting: first sentence only so live TTS starts within ~1 s
 VOBIZ_GREETING_FIRST_SENTENCE = _get_bool("VOBIZ_GREETING_FIRST_SENTENCE", True)
 # Ignore caller STT while the bot is speaking (prevents overlapping replies on phone echo)

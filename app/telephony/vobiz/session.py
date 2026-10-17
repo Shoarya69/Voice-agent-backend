@@ -75,27 +75,12 @@ class VobizCompoundSession(CompoundPipelineSession):
         return await self.send_pcm_frame(pcm_frame)
 
     async def _send_paced_frame(self, frame, timeline=None, playback_started=False):
-        """Vobiz playAudio is paced by the carrier — avoid Exotel 20 ms clock gaps."""
-        if not config.VOBIZ_SKIP_PLAYBACK_PACING:
-            return await super()._send_paced_frame(frame, timeline, playback_started)
+        """Send μ-law at 20 ms per frame so Vobiz plays the whole line.
 
-        if self._closed or not self._websocket_is_open():
-            return False
-        send_started = time.perf_counter()
-        if not await self._send_pcm_frame(frame):
-            return False
-        send_latency_ms = (time.perf_counter() - send_started) * 1000
-
-        if config.ENABLE_LATENCY_TRACE:
-            from app.latency_trace import active_trace
-
-            trace = active_trace()
-            if trace is not None:
-                trace.record_exotel_send(pace_delay_ms=0.0, send_latency_ms=send_latency_ms)
-        if timeline is not None:
-            timeline.mark_once("first_packet_sent_ms")
-            timeline.mark("last_packet_sent_ms")
-        return True
+        Bursting the full clip in a few milliseconds overflows the carrier
+        buffer: only the first half-second is heard, then the line cuts.
+        """
+        return await super()._send_paced_frame(frame, timeline, playback_started)
 
     def _arm_echo_guard(self) -> None:
         loop = asyncio.get_running_loop()
@@ -106,7 +91,7 @@ class VobizCompoundSession(CompoundPipelineSession):
 
     async def _debounced_finish_playback(self) -> None:
         try:
-            await asyncio.sleep(0.08)
+            await asyncio.sleep(0.25)
             await self._vobiz_finish_playback()
         except asyncio.CancelledError:
             raise
