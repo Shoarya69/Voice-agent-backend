@@ -58,7 +58,7 @@ async def _prime_http_clients() -> None:
         from app.openai_service import openai_brain
 
         if openai_brain._client is not None:
-            logger.debug("OpenAI async client ready")
+            await openai_brain.warm()
     except Exception:
         pass
 

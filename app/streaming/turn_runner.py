@@ -58,6 +58,7 @@ class StreamingTurnRunner:
         turn_started: float,
         should_end_call: list[bool],
         llm_user_text: str | None = None,
+        prepared_reply: str | None = None,
     ) -> tuple[str, TTSStats]:
         history.append({"role": "user", "content": user_text})
         llm_messages = list(history)
@@ -80,6 +81,24 @@ class StreamingTurnRunner:
         )
 
         use_http_tts = self._connection_id.startswith("vobiz_")
+        if use_http_tts and prepared_reply and prepared_reply.strip():
+            spoken = self._truncate_reply_words(
+                self._strip_call_end_marker(prepared_reply, should_end_call).strip(),
+                word_cap,
+            )
+            timeline.mark_once("llm_first_sentence_ms")
+            timeline.mark_once("tts_first_request_ms")
+            if spoken:
+                await self._play_http_clause(spoken, timeline, timing)
+                stats.clauses = 1
+                reply_parts.append(spoken)
+            reply_text = spoken
+            if reply_text:
+                history.append({"role": "assistant", "content": reply_text})
+            stats.first_byte_ms = timing.get("first_byte_ms")
+            stats.total_ms = round((time.perf_counter() - turn_started) * 1000, 1)
+            return reply_text, stats
+
         playback_task: asyncio.Task | None = None
         if not use_http_tts:
             await self._providers.tts.begin_utterance()

@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from typing import TYPE_CHECKING
 
@@ -23,6 +24,7 @@ from app.streaming.providers.base import STTEventKind
 from app.streaming import warm_pool
 from app.streaming.providers.elevenlabs_stt import ElevenLabsStreamingSTTProvider
 from app.streaming.providers.elevenlabs_tts_ws import ElevenLabsWebSocketTTSProvider
+from app.openai_service import openai_brain
 from app.streaming.turn_runner import StreamingTurnRunner
 from app.telephony.vobiz.conversation import (
     arm_stt_gate_after_bot_spoke,
@@ -49,6 +51,9 @@ class StreamingSessionController:
         self._connect_lock = asyncio.Lock()
         self._turn_in_progress = False
         self._cancel_turn = False
+        self._prefetch_task: asyncio.Task | None = None
+        self._prefetch_text = ""
+        self._prefetch_phase = ""
 
     @property
     def enabled(self) -> bool:
@@ -116,6 +121,17 @@ class StreamingSessionController:
 
     async def ensure_connected(self) -> None:
         if not self.enabled:
+            return
+        if self._session.connection_id.startswith("vobiz_"):
+            await self.ensure_stt_if_needed()
+            if not self._connected and self._stt_task is not None:
+                self._connected = True
+                logger.info(
+                    "Streaming pipeline ready conn=%s stt=%s model=%s tts=http",
+                    self._session.connection_id,
+                    config.STT_PROVIDER,
+                    config.STREAMING_STT_MODEL,
+                )
             return
         if self._connected:
             await self.ensure_stt_if_needed()
@@ -198,6 +214,9 @@ class StreamingSessionController:
 
     async def speak_text(self, text: str) -> None:
         """Play arbitrary text (greeting) via streaming TTS."""
+        if self._session.connection_id.startswith("vobiz_"):
+            await self._speak_vobiz_http(text)
+            return
         await self.ensure_connected()
         assert self._providers is not None
         timeline = TurnTimeline(connection_id=self._session.connection_id)
@@ -239,6 +258,105 @@ class StreamingSessionController:
             timeline.emit()
             await self.refresh_stt_after_playback()
 
+    async def _speak_vobiz_http(self, text: str) -> None:
+        """Greeting over the warm HTTP client — no TTS websocket handshake."""
+        await self.ensure_stt_if_needed()
+        timeline = TurnTimeline(connection_id=self._session.connection_id)
+        runner = StreamingTurnRunner(
+            connection_id=self._session.connection_id,
+            providers=self._providers if self._providers is not None else build_streaming_providers(self._session.connection_id),
+            send_frame=self._session._send_paced_frame,
+            is_cancelled=lambda: self._session._closed,
+        )
+        if self._providers is None:
+            self._providers = runner._providers
+        self._session.is_speaking = True
+        try:
+            timeline.mark_once("tts_first_request_ms")
+            await runner._play_http_clause(
+                text, timeline, {"first_clause_ms": None, "first_byte_ms": None}
+            )
+        finally:
+            self._session.is_speaking = False
+            flush_out = getattr(self._session, "flush_playback_output", None)
+            if flush_out is not None:
+                await flush_out()
+            self._session._arm_echo_guard()
+            timeline.emit()
+            await self.refresh_stt_after_playback()
+
+    @staticmethod
+    def _utterance_key(text: str) -> str:
+        return re.sub(r"[^a-z0-9\u0900-\u097f]+", "", (text or "").lower())
+
+    def _prefetch_matches(self, committed: str) -> bool:
+        started = self._utterance_key(self._prefetch_text)
+        final = self._utterance_key(committed)
+        if not started or not final:
+            return False
+        return final == started or (
+            final.startswith(started) and len(final) - len(started) <= 3
+        )
+
+    def _note_partial(self, text: str) -> None:
+        session = self._session
+        if not session.connection_id.startswith("vobiz_"):
+            return
+        if (
+            self._turn_in_progress
+            or session.is_speaking
+            or session._is_playing_welcome
+            or not stt_gate_open(session)
+        ):
+            return
+        cleaned = (text or "").strip()
+        if len(cleaned) < 2 or cleaned == self._prefetch_text:
+            return
+        self._prefetch_text = cleaned
+        if self._prefetch_task is not None and not self._prefetch_task.done():
+            if self._prefetch_phase == "llm":
+                return
+            self._prefetch_task.cancel()
+        delay = 0.0 if cleaned[-1] in ".?!।" else 0.12
+        self._prefetch_phase = "wait"
+        self._prefetch_task = asyncio.create_task(
+            self._prefetch_reply(cleaned, delay)
+        )
+
+    async def _prefetch_reply(self, text: str, delay: float) -> str:
+        if delay:
+            await asyncio.sleep(delay)
+        if text != self._prefetch_text or self._turn_in_progress:
+            return ""
+        self._prefetch_phase = "llm"
+        logger.info(
+            "LLM prefetch conn=%s text=%r",
+            self._session.connection_id,
+            text[:80],
+        )
+        history = list(self._session.history)
+        history.append(
+            {"role": "user", "content": llm_user_content(self._session, text)}
+        )
+        parts: list[str] = []
+        try:
+            async for delta in openai_brain.stream_reply(history):
+                if text != self._prefetch_text:
+                    return ""
+                parts.append(delta)
+                if len("".join(parts).split()) >= config.VOBIZ_REPLY_WORD_MAX:
+                    break
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "LLM prefetch failed conn=%s: %s",
+                self._session.connection_id,
+                exc,
+            )
+            return ""
+        return "".join(parts).strip()
+
     async def _stt_event_loop(self) -> None:
         assert self._providers is not None
         try:
@@ -247,11 +365,7 @@ class StreamingSessionController:
                     trace = active_trace()
                     if trace is not None:
                         trace.record_stt_partial()
-                    logger.debug(
-                        "STT partial conn=%s text=%r",
-                        self._session.connection_id,
-                        event.text[:80],
-                    )
+                    self._note_partial(event.text)
                     continue
                 if event.kind == STTEventKind.ERROR:
                     logger.error(
@@ -359,9 +473,25 @@ class StreamingSessionController:
 
         await session._cancel_response_task()
         self._cancel_turn = False
-        session._set_response_task(self._run_turn(text))
+        prepared_task = None
+        if (
+            self._prefetch_task is not None
+            and self._prefetch_phase == "llm"
+            and self._prefetch_matches(text)
+        ):
+            prepared_task = self._prefetch_task
+        elif self._prefetch_task is not None and not self._prefetch_task.done():
+            self._prefetch_task.cancel()
+        self._prefetch_text = ""
+        self._prefetch_phase = ""
+        self._prefetch_task = None
+        session._set_response_task(self._run_turn(text, prepared_task))
 
-    async def _run_turn(self, user_text: str) -> None:
+    async def _run_turn(
+        self,
+        user_text: str,
+        prepared_task: asyncio.Task | None = None,
+    ) -> None:
         session = self._session
         self._turn_in_progress = True
         timeline = TurnTimeline(connection_id=session.connection_id)
@@ -388,6 +518,25 @@ class StreamingSessionController:
                 is_cancelled=lambda: self._cancel_turn or session._closed,
             )
             session.is_speaking = True
+            prepared_reply = None
+            if prepared_task is not None:
+                try:
+                    prepared_reply = await prepared_task
+                except (asyncio.CancelledError, Exception) as exc:
+                    if isinstance(exc, asyncio.CancelledError):
+                        raise
+                    logger.warning(
+                        "Prefetch unusable conn=%s: %s",
+                        session.connection_id,
+                        exc,
+                    )
+                    prepared_reply = None
+                if prepared_reply:
+                    logger.info(
+                        "LLM prefetch hit conn=%s chars=%s",
+                        session.connection_id,
+                        len(prepared_reply),
+                    )
             turn_coro = runner.run(
                 history=session.history,
                 user_text=user_text,
@@ -395,6 +544,7 @@ class StreamingSessionController:
                 timeline=timeline,
                 turn_started=turn_started,
                 should_end_call=should_end_call,
+                prepared_reply=prepared_reply or None,
             )
             turn_timeout = (
                 config.VOBIZ_LLM_STREAM_MAX_SEC + 8.0

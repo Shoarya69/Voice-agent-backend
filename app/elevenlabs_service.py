@@ -138,7 +138,7 @@ class ElevenLabsService:
                 "POST",
                 f"{self.base_url}/v1/text-to-speech/{config.ELEVENLABS_VOICE_ID}/stream",
                 headers={**self._headers(), "Content-Type": "application/json"},
-                params={"output_format": output_format, "optimize_streaming_latency": 3},
+                params={"output_format": output_format, "optimize_streaming_latency": 4},
                 json={
                     "text": text,
                     "model_id": config.ELEVENLABS_TTS_MODEL,

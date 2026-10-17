@@ -5,6 +5,7 @@ conversation history for context.
 """
 
 import logging
+import time
 from typing import AsyncIterator
 
 import httpx
@@ -35,6 +36,26 @@ class OpenAIBrain:
             self._http_client = http_client
         else:
             self._http_client = None
+
+    async def warm(self) -> None:
+        """Open TLS to OpenAI before the first live turn."""
+        if self._client is None:
+            return
+        started = time.perf_counter()
+        try:
+            await self._client.chat.completions.create(
+                model=config.OPENAI_MODEL,
+                messages=[{"role": "user", "content": "ok"}],
+                max_tokens=1,
+                temperature=0,
+            )
+            logger.info(
+                "OpenAI connection warm ms=%.0f model=%s",
+                (time.perf_counter() - started) * 1000,
+                config.OPENAI_MODEL,
+            )
+        except OpenAIError as exc:
+            logger.warning("OpenAI warmup skipped: %s", exc)
 
     async def close(self) -> None:
         if self._http_client is not None and not self._http_client.is_closed:

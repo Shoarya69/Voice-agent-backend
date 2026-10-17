@@ -164,9 +164,8 @@ class VobizCompoundSession(CompoundPipelineSession):
             return
         started = time.perf_counter()
         try:
-            await self._streaming.ensure_tts_for_greeting()
             logger.info(
-                "Vobiz TTS pre-warmed conn=%s ms=%.0f",
+                "Vobiz HTTP TTS ready conn=%s ms=%.0f",
                 self.connection_id,
                 (time.perf_counter() - started) * 1000,
             )
@@ -181,14 +180,6 @@ class VobizCompoundSession(CompoundPipelineSession):
         """TTS first; STT in background so greeting audio starts within ~1 s."""
         if not self._streaming.enabled:
             return
-        try:
-            await self._streaming.ensure_tts_for_greeting()
-        except Exception as exc:
-            logger.error(
-                "Vobiz TTS connect failed for %s: %s",
-                self.connection_id,
-                exc,
-            )
         asyncio.create_task(self._streaming.ensure_stt_if_needed())
 
     async def speak_welcome(self) -> None:
