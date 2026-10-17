@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from urllib.parse import quote
 from xml.sax.saxutils import escape
@@ -64,6 +65,22 @@ async def handle_answer(request: web.Request) -> web.Response:
         to_number[-4:] if to_number else "",
         (token[:6] + "...") if token else "",
     )
+
+    if config.VOBIZ_PREWARM_ON_ANSWER:
+        if token:
+            asyncio.create_task(
+                lovable_client.prewarm_agent_bundle(
+                    token=token,
+                    source="vobiz_answer",
+                )
+            )
+        elif to_number:
+            asyncio.create_task(
+                lovable_client.prewarm_agent_bundle(
+                    number=to_number,
+                    source="vobiz_answer",
+                )
+            )
 
     try:
         if token:

@@ -80,6 +80,11 @@ VOBIZ_ECHO_GUARD_MS = _get_int("VOBIZ_ECHO_GUARD_MS", 650)
 VOBIZ_STREAMING_CLAUSE_MAX_CHARS = _get_int("VOBIZ_STREAMING_CLAUSE_MAX_CHARS", 52)
 VOBIZ_REPLY_WORD_MAX = _get_int("VOBIZ_REPLY_WORD_MAX", 22)
 VOBIZ_TTS_KEEPALIVE_SEC = _get_float("VOBIZ_TTS_KEEPALIVE_SEC", 8.0)
+# Prewarm agent bundle on /vobiz/answer (during ring) before media WebSocket connects.
+VOBIZ_PREWARM_ON_ANSWER = _get_bool("VOBIZ_PREWARM_ON_ANSWER", True)
+# Keep ElevenLabs TTS TLS/WS hot between calls (startup + periodic refresh).
+VOBIZ_WARM_POOL_ENABLED = _get_bool("VOBIZ_WARM_POOL_ENABLED", True)
+VOBIZ_WARM_POOL_REFRESH_SEC = _get_int("VOBIZ_WARM_POOL_REFRESH_SEC", 180)
 
 # Persist call rows to Supabase ai_calls (in addition to Lovable call-log POST).
 ENABLE_SUPABASE_CALL_RECORDS = _get_bool("ENABLE_SUPABASE_CALL_RECORDS", True)

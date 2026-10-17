@@ -110,6 +110,8 @@ async def handle_vobiz_websocket(websocket) -> None:
             if agent_preloaded:
                 voice_server._commit_agent_config_to_session(session)
                 await session.warm_playback_pipeline()
+                if session._streaming.enabled:
+                    asyncio.create_task(session._streaming.ensure_stt_if_needed())
 
         agent_started = False
 

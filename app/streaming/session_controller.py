@@ -248,7 +248,9 @@ class StreamingSessionController:
             )
             return
         if self._turn_in_progress or not stt_gate_open(session):
-            session._queued_stt_text = text.strip()
+            incoming = text.strip()
+            if incoming and incoming != getattr(session, "_queued_stt_text", None):
+                session._queued_stt_text = incoming
             logger.info(
                 "STT committed queued conn=%s turn=%s gate=%s text=%r",
                 session.connection_id,
@@ -416,15 +418,27 @@ class StreamingSessionController:
             playback_ms = float(stats.total_ms) if stats and stats.total_ms else 0.0
             arm_stt_gate_after_bot_spoke(session, playback_ms=playback_ms)
             await self.refresh_stt_after_playback()
-            queued = getattr(session, "_queued_stt_text", None)
-            if queued:
-                session._queued_stt_text = None
-                logger.info(
-                    "STT processing queued utterance conn=%s text=%r",
-                    session.connection_id,
-                    queued[:80],
-                )
-                await self._handle_committed_transcript(queued, None)
+            if getattr(session, "_queued_stt_text", None):
+                asyncio.create_task(self._drain_queued_stt())
+
+    async def _drain_queued_stt(self) -> None:
+        session = self._session
+        if session._closed:
+            return
+        until = getattr(session, "_stt_gate_until", 0.0)
+        wait_s = until - asyncio.get_running_loop().time()
+        if wait_s > 0:
+            await asyncio.sleep(wait_s + 0.05)
+        queued = getattr(session, "_queued_stt_text", None)
+        if not queued or session._closed:
+            return
+        session._queued_stt_text = None
+        logger.info(
+            "STT processing queued utterance conn=%s text=%r",
+            session.connection_id,
+            queued[:80],
+        )
+        await self._handle_committed_transcript(queued, None)
 
     def cancel_active_turn(self) -> None:
         self._cancel_turn = True
