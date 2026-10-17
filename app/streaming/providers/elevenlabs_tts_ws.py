@@ -120,6 +120,7 @@ class ElevenLabsWebSocketTTSProvider(StreamingTTSProvider):
         )
         self._connected = True
         self._utterance_open = False
+        self._voice_id = config.ELEVENLABS_VOICE_ID
         self._reader_task = asyncio.create_task(self._read_loop())
         if self._keepalive_task is None or self._keepalive_task.done():
             self._keepalive_task = asyncio.create_task(self._keepalive_loop())

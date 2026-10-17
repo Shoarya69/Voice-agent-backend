@@ -103,9 +103,6 @@ class VobizCompoundSession(CompoundPipelineSession):
         if self._finish_playback_task is not None and not self._finish_playback_task.done():
             self._finish_playback_task.cancel()
         self._finish_playback_task = asyncio.create_task(self._debounced_finish_playback())
-        if self._finish_playback_task is not None and not self._finish_playback_task.done():
-            self._finish_playback_task.cancel()
-        self._finish_playback_task = asyncio.create_task(self._debounced_finish_playback())
 
     async def _debounced_finish_playback(self) -> None:
         try:

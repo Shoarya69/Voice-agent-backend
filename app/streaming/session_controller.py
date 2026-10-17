@@ -68,6 +68,12 @@ class StreamingSessionController:
                 tts = borrowed
             elif not getattr(tts, "_connected", False):
                 await tts.connect()
+            wanted = config.ELEVENLABS_VOICE_ID
+            if (
+                isinstance(tts, ElevenLabsWebSocketTTSProvider)
+                and getattr(tts, "_voice_id", None) not in (None, wanted)
+            ):
+                await tts.hard_reconnect()
             self._tts_ready = True
 
     async def prepare_tts_for_dialogue(self) -> None:

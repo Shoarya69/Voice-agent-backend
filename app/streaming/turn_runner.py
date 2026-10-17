@@ -139,9 +139,7 @@ class StreamingTurnRunner:
                             trace = active_trace()
                             if trace is not None:
                                 trace.record_llm_clause(clause)
-                            if use_http_tts:
-                                await self._play_http_clause(clause, timeline, timing)
-                            else:
+                            if not use_http_tts:
                                 await self._providers.tts.send_text(clause)
                             stats.clauses += 1
                             if words_sent >= word_cap:
@@ -166,11 +164,19 @@ class StreamingTurnRunner:
                             trace = active_trace()
                             if trace is not None:
                                 trace.record_llm_clause(tail)
-                            if use_http_tts:
-                                await self._play_http_clause(tail, timeline, timing)
-                            else:
+                            if not use_http_tts:
                                 await self._providers.tts.send_text(tail)
                             stats.clauses += 1
+                    if use_http_tts and reply_parts:
+                        spoken = self._truncate_reply_words(
+                            self._strip_call_end_marker(
+                                "".join(reply_parts), should_end_call
+                            ).strip(),
+                            word_cap,
+                        )
+                        if spoken:
+                            timeline.mark_once("tts_first_request_ms")
+                            await self._play_http_clause(spoken, timeline, timing)
                 finally:
                     if stats.clauses > 0 and not use_http_tts:
                         await self._providers.tts.flush_utterance()
