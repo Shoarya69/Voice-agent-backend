@@ -70,6 +70,14 @@ class StreamingSessionController:
                 await tts.connect()
             self._tts_ready = True
 
+    async def prepare_tts_for_dialogue(self) -> None:
+        """After greeting on a pooled socket, reconnect so the next turn gets audio."""
+        if not self.enabled or self._providers is None:
+            return
+        tts = self._providers.tts
+        if isinstance(tts, ElevenLabsWebSocketTTSProvider):
+            await tts.hard_reconnect()
+
     async def ensure_stt_if_needed(self) -> None:
         if not self.enabled:
             return
@@ -222,7 +230,9 @@ class StreamingSessionController:
                 await flush_out()
             self._session._arm_echo_guard()
             timeline.emit()
-            if not self._session._is_playing_welcome:
+            if self._session._is_playing_welcome:
+                await self.prepare_tts_for_dialogue()
+            else:
                 await self.refresh_stt_after_playback()
 
     async def _stt_event_loop(self) -> None:

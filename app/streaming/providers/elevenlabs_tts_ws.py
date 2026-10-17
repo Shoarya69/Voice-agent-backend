@@ -61,11 +61,19 @@ class ElevenLabsWebSocketTTSProvider(StreamingTTSProvider):
         async with self._socket_lock:
             await self._open_socket_locked()
 
-    async def _open_socket_locked(self) -> None:
+    def _socket_healthy(self) -> bool:
+        return (
+            self._connected
+            and self._ws is not None
+            and self._reader_task is not None
+            and not self._reader_task.done()
+        )
+
+    async def _open_socket_locked(self, *, force: bool = False) -> None:
         if not config.ELEVENLABS_API_KEY:
             raise RuntimeError("ELEVENLABS_API_KEY is not configured")
 
-        if self._connected and self._ws is not None:
+        if not force and self._socket_healthy():
             return
 
         had_live_socket = self._ws is not None
@@ -76,6 +84,15 @@ class ElevenLabsWebSocketTTSProvider(StreamingTTSProvider):
                 await self._reader_task
             except asyncio.CancelledError:
                 pass
+            self._reader_task = None
+
+        if self._ws is not None:
+            try:
+                await self._ws.close()
+            except Exception:
+                pass
+            self._ws = None
+        self._connected = False
 
         uri = self._build_uri()
         self._ws = await websockets.connect(
@@ -125,6 +142,19 @@ class ElevenLabsWebSocketTTSProvider(StreamingTTSProvider):
         self._utterance_open = False
         self._flush_sent = False
 
+    async def hard_reconnect(self) -> None:
+        """Fresh ElevenLabs stream-input socket (fixes multi-utterance / keepalive glitches)."""
+        if self._closed:
+            return
+        async with self._socket_lock:
+            await self._open_socket_locked(force=True)
+        self._prepare_for_reuse()
+        logger.info(
+            "ElevenLabs TTS hard reconnect conn=%s reconnects=%s",
+            self._connection_id,
+            self._reconnects,
+        )
+
     async def begin_utterance(self) -> None:
         if self._closed:
             return
@@ -136,8 +166,9 @@ class ElevenLabsWebSocketTTSProvider(StreamingTTSProvider):
                     break
             self._utterance_done.clear()
             self._flush_sent = False
-            if not self._connected or self._ws is None:
-                await self._open_socket()
+            if not self._socket_healthy():
+                async with self._socket_lock:
+                    await self._open_socket_locked(force=True)
             self._utterance_open = True
 
     async def send_text(self, text: str) -> None:
@@ -251,11 +282,24 @@ class ElevenLabsWebSocketTTSProvider(StreamingTTSProvider):
             return max(5.0, config.VOBIZ_TTS_KEEPALIVE_SEC)
         return 15.0
 
+    def _allow_text_keepalive(self) -> bool:
+        """Text keepalive only on idle pool sockets — never on live Vobiz calls."""
+        if self._connection_id.startswith("vobiz_"):
+            return False
+        return self._connection_id.startswith("_tts_pool_")
+
     async def _keepalive_loop(self) -> None:
         try:
             while not self._closed:
                 await asyncio.sleep(self._keepalive_interval_sec())
-                if self._closed or self._ws is None or self._utterance_open:
+                if (
+                    self._closed
+                    or self._ws is None
+                    or not self._allow_text_keepalive()
+                    or self._utterance_open
+                    or self._flush_sent
+                    or not self._utterance_done.is_set()
+                ):
                     continue
                 try:
                     await self._ws.send(json.dumps({"text": " "}))

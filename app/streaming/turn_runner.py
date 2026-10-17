@@ -18,6 +18,7 @@ from app.runtime import tts_semaphore
 from app.streaming.clause_buffer import split_next_clause
 from app.streaming.factory import StreamingProviders
 from app.streaming.providers.base import TTSStats
+from app.streaming.providers.elevenlabs_tts_ws import ElevenLabsWebSocketTTSProvider
 from app.streaming.providers.openai_llm import brain_error_type
 from app.turn_timeline import TurnTimeline
 
@@ -168,10 +169,22 @@ class StreamingTurnRunner:
                 pass
             if timing.get("first_byte_ms") is None and reply_parts:
                 logger.warning(
-                    "TTS produced no audio conn=%s clauses=%s — check ElevenLabs key/voice",
+                    "TTS produced no audio conn=%s clauses=%s — reconnect + one-shot retry",
                     self._connection_id,
                     stats.clauses,
                 )
+                retry_text = self._truncate_reply_words(
+                    self._strip_call_end_marker(
+                        "".join(reply_parts), should_end_call
+                    ).strip(),
+                    word_cap,
+                )
+                if retry_text and isinstance(
+                    self._providers.tts, ElevenLabsWebSocketTTSProvider
+                ):
+                    await self._retry_turn_audio(
+                        retry_text, timeline, timing, stats, turn_started
+                    )
 
         reply_text = self._truncate_reply_words(
             self._strip_call_end_marker("".join(reply_parts), should_end_call).strip(),
@@ -183,6 +196,37 @@ class StreamingTurnRunner:
         stats.first_byte_ms = timing.get("first_byte_ms")
         stats.total_ms = round((time.perf_counter() - turn_started) * 1000, 1)
         return reply_text, stats
+
+    async def _retry_turn_audio(
+        self,
+        text: str,
+        timeline: TurnTimeline,
+        timing: dict,
+        stats: TTSStats,
+        turn_started: float,
+    ) -> None:
+        tts = self._providers.tts
+        assert isinstance(tts, ElevenLabsWebSocketTTSProvider)
+        await tts.hard_reconnect()
+        playback_task = asyncio.create_task(
+            self._playback_utterance(timeline, timing, stats)
+        )
+        try:
+            await tts.begin_utterance()
+            timeline.mark_once("tts_first_request_ms")
+            await tts.send_text(text)
+            await tts.flush_utterance()
+        finally:
+            try:
+                await asyncio.wait_for(playback_task, timeout=12.0)
+            except asyncio.TimeoutError:
+                playback_task.cancel()
+                logger.warning(
+                    "TTS retry playback timed out conn=%s",
+                    self._connection_id,
+                )
+            except asyncio.CancelledError:
+                pass
 
     async def _playback_utterance(
         self,
