@@ -16,6 +16,7 @@ from app.audio_utils import (
     scale_pcm_volume,
     ulaw_bytes_to_pcm,
 )
+from app.telephony.vobiz.conversation import arm_stt_gate_after_bot_spoke
 from app.telephony.vobiz.stream import VobizStream
 from app.voice_pipeline.compound.session import CompoundPipelineSession
 
@@ -36,6 +37,10 @@ class VobizCompoundSession(CompoundPipelineSession):
         self._ulaw_out_buffer = bytearray()
         self._playback_turn = 0
         self._finish_playback_task: asyncio.Task | None = None
+        self._stt_gate_until = 0.0
+        self._last_bot_spoke_at = 0.0
+        self._last_spoken_reply = ""
+        self._queued_stt_text: str | None = None
 
     async def add_audio_chunk(self, media_data: dict) -> None:
         payload = media_data.get("payload", "")
@@ -92,7 +97,11 @@ class VobizCompoundSession(CompoundPipelineSession):
         return True
 
     def _arm_echo_guard(self) -> None:
-        super()._arm_echo_guard()
+        loop = asyncio.get_running_loop()
+        self._echo_guard_until = loop.time() + (config.VOBIZ_ECHO_GUARD_MS / 1000)
+        if self._finish_playback_task is not None and not self._finish_playback_task.done():
+            self._finish_playback_task.cancel()
+        self._finish_playback_task = asyncio.create_task(self._debounced_finish_playback())
         if self._finish_playback_task is not None and not self._finish_playback_task.done():
             self._finish_playback_task.cancel()
         self._finish_playback_task = asyncio.create_task(self._debounced_finish_playback())
@@ -244,6 +253,7 @@ class VobizCompoundSession(CompoundPipelineSession):
             self._is_playing_welcome = False
             await self.flush_playback_output()
             self._arm_echo_guard()
+            arm_stt_gate_after_bot_spoke(self, playback_ms=600)
 
     async def close(self) -> None:
         if self._finish_playback_task is not None:

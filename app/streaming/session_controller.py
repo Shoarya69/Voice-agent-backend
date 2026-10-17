@@ -21,6 +21,12 @@ from app.runtime import stt_semaphore
 from app.streaming.factory import StreamingProviders, build_streaming_providers
 from app.streaming.providers.base import STTEventKind
 from app.streaming.turn_runner import StreamingTurnRunner
+from app.telephony.vobiz.conversation import (
+    arm_stt_gate_after_bot_spoke,
+    llm_user_content,
+    should_ignore_committed,
+    stt_gate_open,
+)
 from app.turn_timeline import TurnTimeline
 
 if TYPE_CHECKING:
@@ -240,10 +246,13 @@ class StreamingSessionController:
                 text[:80],
             )
             return
-        if self._turn_in_progress:
-            logger.debug(
-                "STT committed dropped conn=%s turn_in_progress text=%r",
+        if self._turn_in_progress or not stt_gate_open(session):
+            session._queued_stt_text = text.strip()
+            logger.info(
+                "STT committed queued conn=%s turn=%s gate=%s text=%r",
                 session.connection_id,
+                self._turn_in_progress,
+                not stt_gate_open(session),
                 text[:80],
             )
             return
@@ -278,6 +287,17 @@ class StreamingSessionController:
 
         if not text.strip():
             return
+
+        ignore = should_ignore_committed(session, text)
+        if ignore:
+            logger.info(
+                "STT committed ignored conn=%s reason=%s text=%r",
+                session.connection_id,
+                ignore,
+                text[:80],
+            )
+            return
+
         if not session._accept_stt_result(stt_result, turn_stats):
             logger.info(
                 "REJECTED - streaming stt conn=%s text=%r",
@@ -319,6 +339,7 @@ class StreamingSessionController:
         timeline.stt_ms = 0.0
         turn_started = time.perf_counter()
         should_end_call = [False]
+        stats = None
 
         try:
             assert self._providers is not None
@@ -332,6 +353,7 @@ class StreamingSessionController:
             reply_text, stats = await runner.run(
                 history=session.history,
                 user_text=user_text,
+                llm_user_text=llm_user_content(session, user_text),
                 timeline=timeline,
                 turn_started=turn_started,
                 should_end_call=should_end_call,
@@ -346,6 +368,7 @@ class StreamingSessionController:
                     session._latency_summary.add_turn(trace)
                 return
 
+            session._last_spoken_reply = reply_text
             logger.info("🧠 Assistant (%s) reply: %s", session.connection_id, reply_text)
             turn_total_ms = (time.perf_counter() - turn_started) * 1000
             timeline.sentences = stats.clauses
@@ -388,7 +411,18 @@ class StreamingSessionController:
             session._arm_echo_guard()
             self._turn_in_progress = False
             self._cancel_turn = False
+            playback_ms = float(stats.total_ms) if stats and stats.total_ms else 0.0
+            arm_stt_gate_after_bot_spoke(session, playback_ms=playback_ms)
             await self.refresh_stt_after_playback()
+            queued = getattr(session, "_queued_stt_text", None)
+            if queued:
+                session._queued_stt_text = None
+                logger.info(
+                    "STT processing queued utterance conn=%s text=%r",
+                    session.connection_id,
+                    queued[:80],
+                )
+                await self._handle_committed_transcript(queued, None)
 
     def cancel_active_turn(self) -> None:
         self._cancel_turn = True

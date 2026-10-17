@@ -55,8 +55,12 @@ class StreamingTurnRunner:
         timeline: TurnTimeline,
         turn_started: float,
         should_end_call: list[bool],
+        llm_user_text: str | None = None,
     ) -> tuple[str, TTSStats]:
         history.append({"role": "user", "content": user_text})
+        llm_messages = list(history)
+        if llm_user_text is not None and llm_messages:
+            llm_messages[-1] = {"role": "user", "content": llm_user_text}
 
         timing = {"first_clause_ms": None, "first_byte_ms": None}
         stats = TTSStats()
@@ -76,7 +80,7 @@ class StreamingTurnRunner:
 
         try:
             async with tts_semaphore:
-                async for delta in self._providers.llm.stream_reply(history):
+                async for delta in self._providers.llm.stream_reply(llm_messages):
                     if self._is_cancelled():
                         break
                     if not openai_started:

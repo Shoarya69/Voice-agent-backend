@@ -71,6 +71,11 @@ VOBIZ_SKIP_PLAYBACK_PACING = _get_bool("VOBIZ_SKIP_PLAYBACK_PACING", True)
 VOBIZ_GREETING_FIRST_SENTENCE = _get_bool("VOBIZ_GREETING_FIRST_SENTENCE", True)
 # Ignore caller STT while the bot is speaking (prevents overlapping replies on phone echo)
 VOBIZ_HALF_DUPLEX = _get_bool("VOBIZ_HALF_DUPLEX", True)
+# After bot speaks, ignore STT commits briefly (phone echo + "hello?" while waiting).
+VOBIZ_STT_GATE = _get_bool("VOBIZ_STT_GATE", True)
+VOBIZ_STT_COOLDOWN_MS = _get_int("VOBIZ_STT_COOLDOWN_MS", 1100)
+VOBIZ_SKIP_DUPLICATE_REPLIES = _get_bool("VOBIZ_SKIP_DUPLICATE_REPLIES", True)
+VOBIZ_ECHO_GUARD_MS = _get_int("VOBIZ_ECHO_GUARD_MS", 650)
 
 # Persist call rows to Supabase ai_calls (in addition to Lovable call-log POST).
 ENABLE_SUPABASE_CALL_RECORDS = _get_bool("ENABLE_SUPABASE_CALL_RECORDS", True)
