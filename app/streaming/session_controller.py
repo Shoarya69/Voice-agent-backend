@@ -194,7 +194,8 @@ class StreamingSessionController:
                 await flush_out()
             self._session._arm_echo_guard()
             timeline.emit()
-            await self.refresh_stt_after_playback()
+            if not self._session._is_playing_welcome:
+                await self.refresh_stt_after_playback()
 
     async def _stt_event_loop(self) -> None:
         assert self._providers is not None
@@ -240,6 +241,32 @@ class StreamingSessionController:
             )
             return
         if self._turn_in_progress:
+            logger.debug(
+                "STT committed dropped conn=%s turn_in_progress text=%r",
+                session.connection_id,
+                text[:80],
+            )
+            return
+
+        if session._response_task is not None and not session._response_task.done():
+            logger.info(
+                "STT committed ignored conn=%s response_active text=%r",
+                session.connection_id,
+                text[:80],
+            )
+            return
+
+        if (
+            config.VOBIZ_HALF_DUPLEX
+            and getattr(session, "telephony_provider", "") == "vobiz"
+            and session.is_speaking
+            and not config.ENABLE_BARGE_IN
+        ):
+            logger.info(
+                "STT committed ignored conn=%s bot_speaking text=%r",
+                session.connection_id,
+                text[:80],
+            )
             return
 
         stt_result = STTResult(

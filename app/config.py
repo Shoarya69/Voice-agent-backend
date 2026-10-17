@@ -69,6 +69,8 @@ VOBIZ_ULAW_PLAY_CHUNK = _get_int("VOBIZ_ULAW_PLAY_CHUNK", 160)
 VOBIZ_SKIP_PLAYBACK_PACING = _get_bool("VOBIZ_SKIP_PLAYBACK_PACING", True)
 # Greeting: first sentence only so live TTS starts within ~1 s
 VOBIZ_GREETING_FIRST_SENTENCE = _get_bool("VOBIZ_GREETING_FIRST_SENTENCE", True)
+# Ignore caller STT while the bot is speaking (prevents overlapping replies on phone echo)
+VOBIZ_HALF_DUPLEX = _get_bool("VOBIZ_HALF_DUPLEX", True)
 
 # Persist call rows to Supabase ai_calls (in addition to Lovable call-log POST).
 ENABLE_SUPABASE_CALL_RECORDS = _get_bool("ENABLE_SUPABASE_CALL_RECORDS", True)

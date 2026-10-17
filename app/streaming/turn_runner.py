@@ -148,6 +148,12 @@ class StreamingTurnRunner:
                 await playback_task
             except asyncio.CancelledError:
                 pass
+            if timing.get("first_byte_ms") is None and reply_parts:
+                logger.warning(
+                    "TTS produced no audio conn=%s clauses=%s — check ElevenLabs key/voice",
+                    self._connection_id,
+                    stats.clauses,
+                )
 
         reply_text = self._truncate_reply_words(
             self._strip_call_end_marker("".join(reply_parts), should_end_call).strip(),

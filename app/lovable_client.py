@@ -443,34 +443,13 @@ async def _resolve_agent_bundle_impl(
         )
         return base
 
-    # Inbound: RPC already returned the full agent bundle — never re-query ai_agents.
-    # Optionally fetch greeting PCM from Moontech only (cold-cache synth).
+    # Inbound/outbound RPC bundles already include greeting text (+ optional PCM).
+    # Skip Moontech agent-with-greeting HTTP (~2–3 s); use live TTS when PCM missing/rejected.
     if number and not token:
-        try:
-            greeting = await asyncio.wait_for(
-                supabase_agent_provider.fetch_greeting_from_moontech(base.agent_id),
-                timeout=config.GREETING_MOONTECH_TIMEOUT_SEC,
-            )
-        except asyncio.TimeoutError:
-            logger.warning(
-                "Moontech greeting fetch timed out agent_id=%s after %.1fs — live TTS",
-                base.agent_id,
-                config.GREETING_MOONTECH_TIMEOUT_SEC,
-            )
-            greeting = None
-        pcm = _decode_greeting_pcm(greeting or {}, agent_id=base.agent_id)
-        if pcm:
-            base.greeting_audio_pcm = pcm
-            logger.info(
-                "LATENCY bundle agent_id=%s greeting=moontech pcm_bytes=%s ms=%.0f",
-                base.agent_id,
-                len(pcm),
-                (time.perf_counter() - started) * 1000,
-            )
-            return base
         logger.info(
-            "LATENCY bundle agent_id=%s greeting=live_tts ms=%.0f",
+            "LATENCY bundle agent_id=%s greeting=%s ms=%.0f",
             base.agent_id,
+            "pcm" if base.greeting_audio_pcm else "live_tts",
             (time.perf_counter() - started) * 1000,
         )
         return base

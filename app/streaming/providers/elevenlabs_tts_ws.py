@@ -38,6 +38,8 @@ class ElevenLabsWebSocketTTSProvider(StreamingTTSProvider):
         self._utterance_done = asyncio.Event()
         self._utterance_audio: asyncio.Queue[bytes | None] = asyncio.Queue()
         self._flush_sent = False
+        self._socket_lock = asyncio.Lock()
+        self._utterance_lock = asyncio.Lock()
 
     def _build_uri(self) -> str:
         base = config.ELEVENLABS_BASE_URL.rstrip("/").replace("https://", "wss://")
@@ -52,11 +54,21 @@ class ElevenLabsWebSocketTTSProvider(StreamingTTSProvider):
         )
 
     async def connect(self) -> None:
-        await self._open_socket()
+        async with self._socket_lock:
+            await self._open_socket_locked()
 
     async def _open_socket(self) -> None:
+        async with self._socket_lock:
+            await self._open_socket_locked()
+
+    async def _open_socket_locked(self) -> None:
         if not config.ELEVENLABS_API_KEY:
             raise RuntimeError("ELEVENLABS_API_KEY is not configured")
+
+        if self._connected and self._ws is not None:
+            return
+
+        had_live_socket = self._ws is not None
 
         if self._reader_task is not None:
             self._reader_task.cancel()
@@ -94,7 +106,8 @@ class ElevenLabsWebSocketTTSProvider(StreamingTTSProvider):
         self._reader_task = asyncio.create_task(self._read_loop())
         if self._keepalive_task is None or self._keepalive_task.done():
             self._keepalive_task = asyncio.create_task(self._keepalive_loop())
-        if self._reconnects:
+        if had_live_socket:
+            self._reconnects += 1
             logger.info(
                 "ElevenLabs TTS websocket reconnected conn=%s count=%s",
                 self._connection_id,
@@ -104,19 +117,17 @@ class ElevenLabsWebSocketTTSProvider(StreamingTTSProvider):
     async def begin_utterance(self) -> None:
         if self._closed:
             return
-        while not self._utterance_audio.empty():
-            try:
-                self._utterance_audio.get_nowait()
-            except asyncio.QueueEmpty:
-                break
-        self._utterance_done.clear()
-        self._flush_sent = False
-        if not self._connected or self._ws is None:
-            was_up = self._connected
-            await self._open_socket()
-            if was_up or self._reconnects:
-                self._reconnects += 1
-        self._utterance_open = True
+        async with self._utterance_lock:
+            while not self._utterance_audio.empty():
+                try:
+                    self._utterance_audio.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+            self._utterance_done.clear()
+            self._flush_sent = False
+            if not self._connected or self._ws is None:
+                await self._open_socket()
+            self._utterance_open = True
 
     async def send_text(self, text: str) -> None:
         chunk = (text or "").strip()
@@ -213,7 +224,12 @@ class ElevenLabsWebSocketTTSProvider(StreamingTTSProvider):
 
     async def _recover_and_send(self, text: str) -> None:
         self._connected = False
-        self._reconnects += 1
+        if self._ws is not None:
+            try:
+                await self._ws.close()
+            except Exception:
+                pass
+        self._ws = None
         await self._open_socket()
         self._utterance_open = True
         assert self._ws is not None
