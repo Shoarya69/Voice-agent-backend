@@ -74,13 +74,15 @@ class GeminiLiveLink:
             {
                 "setup": {
                     "model": f"models/{config.GEMINI_LIVE_MODEL}",
-                    "responseModalities": ["AUDIO"],
-                    "speechConfig": {
-                        "voiceConfig": {
-                            "prebuiltVoiceConfig": {
-                                "voiceName": config.GEMINI_LIVE_VOICE,
+                    "generationConfig": {
+                        "responseModalities": ["AUDIO"],
+                        "speechConfig": {
+                            "voiceConfig": {
+                                "prebuiltVoiceConfig": {
+                                    "voiceName": config.GEMINI_LIVE_VOICE,
+                                }
                             }
-                        }
+                        },
                     },
                     "systemInstruction": {
                         "parts": [{"text": instructions}],

@@ -124,10 +124,19 @@ VOICE_PIPELINE = os.getenv("VOICE_PIPELINE", "compound").strip().lower()
 
 # Gemini Live (only when VOICE_PIPELINE=gemini_live)
 GEMINI_API_KEY = (os.getenv("GEMINI_API_KEY", "") or os.getenv("GOOGLE_API_KEY", "")).strip()
-GEMINI_LIVE_MODEL = os.getenv(
-    "GEMINI_LIVE_MODEL", "gemini-3.8-live"
-).strip()
-GEMINI_LIVE_VOICE = os.getenv("GEMINI_LIVE_VOICE", "Kore").strip()
+def _gemini_token(env_name: str, default: str) -> str:
+    """Accept a bare value, or a pasted ``NAME=value`` line."""
+    raw = (os.getenv(env_name, default) or default).strip().strip('"').strip("'")
+    prefix = f"{env_name}="
+    if raw.startswith(prefix):
+        raw = raw[len(prefix) :].strip().strip('"').strip("'")
+    if raw.startswith("models/"):
+        raw = raw[len("models/") :]
+    return raw or default
+
+
+GEMINI_LIVE_MODEL = _gemini_token("GEMINI_LIVE_MODEL", "gemini-3.8-live")
+GEMINI_LIVE_VOICE = _gemini_token("GEMINI_LIVE_VOICE", "Kore")
 GEMINI_LIVE_WS_URL = os.getenv(
     "GEMINI_LIVE_WS_URL",
     "wss://generativelanguage.googleapis.com/ws/"
