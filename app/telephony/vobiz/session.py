@@ -143,6 +143,20 @@ class VobizCompoundSession(CompoundPipelineSession):
             first = first + "."
         return first or text
 
+    def _opening_for_call(self, text: str) -> str:
+        """Keep a one-word 'Namaste!' from swallowing the rest of the greeting."""
+        parts = [p.strip() for p in _SENTENCE_END.split(text or "") if p.strip()]
+        if not parts:
+            return (text or "").strip()
+        kept = [parts[0]]
+        if len(parts) > 1 and len(parts[0].split()) <= 3:
+            kept.append(parts[1])
+        opening = " ".join(kept)
+        words = opening.split()
+        if len(words) > 18:
+            opening = " ".join(words[:18]).strip()
+        return opening
+
     def _welcome_text(self) -> str:
         text = (config.WELCOME_MESSAGE or "").strip()
         if not text:
@@ -152,7 +166,7 @@ class VobizCompoundSession(CompoundPipelineSession):
             else:
                 text = "Namaste, main aapki madad ke liye hoon."
         if config.VOBIZ_GREETING_FIRST_SENTENCE:
-            text = self._first_sentence(text)
+            text = self._opening_for_call(text)
         words = text.split()
         if len(words) > config.MAX_WELCOME_WORDS:
             text = " ".join(words[: config.MAX_WELCOME_WORDS]).strip()

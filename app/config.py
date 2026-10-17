@@ -78,7 +78,7 @@ VOBIZ_SKIP_DUPLICATE_REPLIES = _get_bool("VOBIZ_SKIP_DUPLICATE_REPLIES", True)
 VOBIZ_ECHO_GUARD_MS = _get_int("VOBIZ_ECHO_GUARD_MS", 650)
 # Fewer TTS clause splits → smoother, more human prosody on Vobiz
 VOBIZ_STREAMING_CLAUSE_MAX_CHARS = _get_int("VOBIZ_STREAMING_CLAUSE_MAX_CHARS", 52)
-VOBIZ_REPLY_WORD_MAX = _get_int("VOBIZ_REPLY_WORD_MAX", 22)
+VOBIZ_REPLY_WORD_MAX = _get_int("VOBIZ_REPLY_WORD_MAX", 26)
 # Stop waiting on OpenAI stream if no token this long (avoids hung turn + no TTS flush).
 VOBIZ_LLM_STREAM_IDLE_SEC = _get_float("VOBIZ_LLM_STREAM_IDLE_SEC", 1.25)
 VOBIZ_LLM_STREAM_MAX_SEC = _get_float("VOBIZ_LLM_STREAM_MAX_SEC", 12.0)
@@ -150,8 +150,8 @@ _OPENAI_TEMPERATURE_DEFAULT = _get_float("OPENAI_TEMPERATURE", 0.6)
 _OPENAI_MAX_TOKENS_DEFAULT = _get_int("OPENAI_MAX_TOKENS", 45)
 # Platform-enforced cap: NOT overridable by per-agent MoontechPro/Lovable config.
 OPENAI_MAX_TOKENS = _OPENAI_MAX_TOKENS_DEFAULT
-REPLY_WORD_TARGET = _get_int("REPLY_WORD_TARGET", 10)
-REPLY_WORD_MAX = _get_int("REPLY_WORD_MAX", 30)
+REPLY_WORD_TARGET = _get_int("REPLY_WORD_TARGET", 16)
+REPLY_WORD_MAX = _get_int("REPLY_WORD_MAX", 28)
 _SYSTEM_PROMPT_DEFAULT = os.getenv(
     "SYSTEM_PROMPT",
     "You are a friendly Hindi/Hinglish voice assistant on a live phone call. "
@@ -175,12 +175,12 @@ CALL_END_INSTRUCTION = (
 )
 CALL_BEHAVIOR_INSTRUCTION = (
     "MANDATORY (overrides conflicting instructions above): "
-    "Answer every caller question on this live call — do not defer, deflect, or postpone. "
-    "Never say you will call back, callback, follow up later, or that someone else will call "
-    "unless the caller explicitly asks to be called later. "
-    "When asked about products, services, or what you offer, briefly name them from the "
-    "business details in your instructions above (within the word limit). "
-    "If the list is long, give the top two or three items and invite one short follow-up question."
+    "Talk like a person on a live phone call, in the same language the caller just used. "
+    "No announcer tone, no 'thank you for confirming', no reading the same script line again. "
+    "If they say yes, haan, ok, or yeah, move to the next step — do not ask that question again. "
+    "Answer every caller question on this call — do not defer or say you will call back "
+    "unless they explicitly ask to be called later. "
+    "When asked what you offer, name the top one or two items from your instructions, briefly."
 )
 # Appended after every agent/system prompt in openai_service — not overridable.
 MANDATORY_PLATFORM_RULES_HEADER = (
@@ -198,9 +198,9 @@ ELEVENLABS_STT_MODEL = os.getenv("ELEVENLABS_STT_MODEL", "scribe_v1")
 _ELEVENLABS_STT_LANGUAGE_DEFAULT = os.getenv("ELEVENLABS_STT_LANGUAGE", "")
 ELEVENLABS_BASE_URL = os.getenv("ELEVENLABS_BASE_URL", "https://api.elevenlabs.io")
 # TTS expressiveness (lower stability = more natural variation on calls)
-ELEVENLABS_TTS_STABILITY = _get_float("ELEVENLABS_TTS_STABILITY", 0.38)
-ELEVENLABS_TTS_SIMILARITY = _get_float("ELEVENLABS_TTS_SIMILARITY_BOOST", 0.82)
-ELEVENLABS_TTS_STYLE = _get_float("ELEVENLABS_TTS_STYLE", 0.32)
+ELEVENLABS_TTS_STABILITY = _get_float("ELEVENLABS_TTS_STABILITY", 0.42)
+ELEVENLABS_TTS_SIMILARITY = _get_float("ELEVENLABS_TTS_SIMILARITY_BOOST", 0.78)
+ELEVENLABS_TTS_STYLE = _get_float("ELEVENLABS_TTS_STYLE", 0.12)
 ELEVENLABS_TTS_SPEAKER_BOOST = _get_bool("ELEVENLABS_TTS_USE_SPEAKER_BOOST", True)
 
 # ---------------------------------------------------------------------------

@@ -10,13 +10,17 @@ from app import config
 # Short backchannels / echo that STT fires while the caller waits for the bot.
 _TIME_CHECK = re.compile(r"(?:2|do|two)\s*minute", re.IGNORECASE)
 
-_FILLER_ONLY = re.compile(
-    r"^(?:"
-    r"hello+|hi+|hey+|hiya|"
-    r"yes+|yeah|yep|yup|ok(?:ay)?|"
-    r"haan|ji+|namaste|"
-    r"uh+|um+|hmm+|mm+hmm"
-    r")[\s\?\.!,]*$",
+# Noise while the line is open. "Yes / haan / ok" are real answers, not noise.
+_ECHO_ONLY = re.compile(
+    r"^(?:uh+|um+|hmm+|mm+|mm+hmm)[\s\?\.!,]*$",
+    re.IGNORECASE,
+)
+_LINE_CHECK = re.compile(
+    r"^(?:hello+|hi+|hey+|hiya|namaste)[\s\?\.!,]*$",
+    re.IGNORECASE,
+)
+_AGREEMENT = re.compile(
+    r"^(?:yes+|yeah|yep|yup|ok(?:ay)?|haan+|ha+|ji+|theek|thik|bilkul)[\s\?\.!,]*$",
     re.IGNORECASE,
 )
 
@@ -26,12 +30,11 @@ def normalize_reply(text: str) -> str:
 
 
 def is_filler_transcript(text: str) -> bool:
+    """True only for uh/um/hmm. Agreements and hellos are real turns."""
     t = (text or "").strip()
     if not t:
         return True
-    if len(t.split()) <= 4 and _FILLER_ONLY.match(t):
-        return True
-    return False
+    return bool(_ECHO_ONLY.match(t))
 
 
 def stt_gate_open(session) -> bool:
@@ -62,9 +65,14 @@ def should_ignore_committed(session, text: str) -> str | None:
     if not stt_gate_open(session):
         return "stt_gate"
     if is_filler_transcript(text):
-        last = getattr(session, "_last_bot_spoke_at", 0.0)
-        if last and asyncio.get_running_loop().time() - last < 10.0:
-            return "filler_after_bot"
+        return "filler_after_bot"
+    last = getattr(session, "_last_bot_spoke_at", 0.0)
+    if (
+        last
+        and _LINE_CHECK.match((text or "").strip())
+        and asyncio.get_running_loop().time() - last < 1.4
+    ):
+        return "echo_hello"
     return None
 
 
@@ -84,13 +92,20 @@ def llm_user_content(session, user_text: str) -> str:
         notes.append(
             "You already asked if they have 2 minutes — do not ask again; move the conversation forward."
         )
-    if is_filler_transcript(user_text):
+    if _AGREEMENT.match(user_text.strip()):
         notes.append(
-            "Caller is only checking the line. One brief different sentence, then continue — "
-            "never repeat your last line word-for-word."
+            "They said yes. Continue the conversation in their language. "
+            "Do not repeat your last question."
         )
-    elif len(user_text.split()) <= 6:
-        notes.append("Reply in one short spoken sentence, friendly and natural.")
+    elif _LINE_CHECK.match(user_text.strip()):
+        notes.append(
+            "They greeted you. Answer like a person, in their language, then one next step. "
+            "Do not restart a script."
+        )
+    elif len(user_text.split()) <= 8:
+        notes.append(
+            "Answer what they just said, in the same language, like a phone call. One or two spoken sentences."
+        )
     if not notes:
         return user_text
     return f"{user_text.strip()}\n\n(" + " ".join(notes) + ")"
