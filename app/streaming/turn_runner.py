@@ -79,13 +79,15 @@ class StreamingTurnRunner:
             else None
         )
 
-        await self._providers.tts.begin_utterance()
-        if hasattr(self._providers.tts, "reconnect_count"):
-            stats.reconnects = getattr(self._providers.tts, "reconnect_count", 0)
-
-        playback_task = asyncio.create_task(
-            self._playback_utterance(timeline, timing, stats)
-        )
+        use_http_tts = self._connection_id.startswith("vobiz_")
+        playback_task: asyncio.Task | None = None
+        if not use_http_tts:
+            await self._providers.tts.begin_utterance()
+            if hasattr(self._providers.tts, "reconnect_count"):
+                stats.reconnects = getattr(self._providers.tts, "reconnect_count", 0)
+            playback_task = asyncio.create_task(
+                self._playback_utterance(timeline, timing, stats)
+            )
 
         llm_buffer = ""
         openai_started = False
@@ -137,7 +139,10 @@ class StreamingTurnRunner:
                             trace = active_trace()
                             if trace is not None:
                                 trace.record_llm_clause(clause)
-                            await self._providers.tts.send_text(clause)
+                            if use_http_tts:
+                                await self._play_http_clause(clause, timeline, timing)
+                            else:
+                                await self._providers.tts.send_text(clause)
                             stats.clauses += 1
                             if words_sent >= word_cap:
                                 llm_buffer = ""
@@ -161,10 +166,13 @@ class StreamingTurnRunner:
                             trace = active_trace()
                             if trace is not None:
                                 trace.record_llm_clause(tail)
-                            await self._providers.tts.send_text(tail)
+                            if use_http_tts:
+                                await self._play_http_clause(tail, timeline, timing)
+                            else:
+                                await self._providers.tts.send_text(tail)
                             stats.clauses += 1
                 finally:
-                    if stats.clauses > 0:
+                    if stats.clauses > 0 and not use_http_tts:
                         await self._providers.tts.flush_utterance()
         except BrainError as exc:
             logger.error("Brain error for %s: %s", self._connection_id, exc)
@@ -174,17 +182,22 @@ class StreamingTurnRunner:
                 await self._providers.tts.flush_utterance()
                 reply_parts.append(fallback)
         finally:
-            try:
-                await asyncio.wait_for(playback_task, timeout=14.0)
-            except asyncio.TimeoutError:
-                playback_task.cancel()
-                logger.warning(
-                    "TTS playback timed out conn=%s",
-                    self._connection_id,
-                )
-            except asyncio.CancelledError:
-                pass
-            if timing.get("first_byte_ms") is None and reply_parts:
+            if playback_task is not None:
+                try:
+                    await asyncio.wait_for(playback_task, timeout=3.0)
+                except asyncio.TimeoutError:
+                    playback_task.cancel()
+                    logger.warning(
+                        "TTS playback timed out conn=%s",
+                        self._connection_id,
+                    )
+                except asyncio.CancelledError:
+                    pass
+            if (
+                not use_http_tts
+                and timing.get("first_byte_ms") is None
+                and reply_parts
+            ):
                 logger.warning(
                     "TTS produced no audio conn=%s clauses=%s — reconnect + one-shot retry",
                     self._connection_id,
@@ -266,6 +279,19 @@ class StreamingTurnRunner:
                 except Exception:
                     pass
 
+    async def _play_http_clause(
+        self,
+        text: str,
+        timeline: TurnTimeline,
+        timing: dict,
+    ) -> None:
+        logger.info(
+            "HTTP TTS speak conn=%s chars=%s",
+            self._connection_id,
+            len(text),
+        )
+        await self._play_http_pcm(text, timeline, timing)
+
     async def _play_http_fallback(
         self,
         text: str,
@@ -277,6 +303,14 @@ class StreamingTurnRunner:
             self._connection_id,
             len(text),
         )
+        await self._play_http_pcm(text, timeline, timing)
+
+    async def _play_http_pcm(
+        self,
+        text: str,
+        timeline: TurnTimeline,
+        timing: dict,
+    ) -> None:
         residual = bytearray()
         playback_started = False
         try:

@@ -230,10 +230,7 @@ class StreamingSessionController:
                 await flush_out()
             self._session._arm_echo_guard()
             timeline.emit()
-            if self._session._is_playing_welcome:
-                await self.prepare_tts_for_dialogue()
-            else:
-                await self.refresh_stt_after_playback()
+            await self.refresh_stt_after_playback()
 
     async def _stt_event_loop(self) -> None:
         assert self._providers is not None
