@@ -5,6 +5,7 @@ Switch implementations via ``VOICE_PIPELINE`` in ``.env`` (no application code c
 
   compound         — ElevenLabs STT → OpenAI → ElevenLabs TTS (production default)
   openai_realtime  — OpenAI Realtime API (speech-to-speech)
+  gemini_live      — Gemini Native Multimodal Live (speech-to-speech, no ElevenLabs/ChatGPT)
 """
 
 from app.voice_pipeline.base import VoicePipelineSession

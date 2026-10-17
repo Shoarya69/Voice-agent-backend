@@ -35,6 +35,8 @@ class VobizCompoundSession(CompoundPipelineSession):
         self.telephony_provider = "vobiz"
         self._vobiz = vobiz
         self._ulaw_out_buffer = bytearray()
+        self._play_origin: float | None = None
+        self._play_sent_ms = 0.0
         self._playback_turn = 0
         self._finish_playback_task: asyncio.Task | None = None
         self._stt_gate_until = 0.0
@@ -52,35 +54,61 @@ class VobizCompoundSession(CompoundPipelineSession):
         await super().add_audio_chunk({"payload": encode_payload(pcm)})
 
     async def send_pcm_frame(self, pcm_frame: bytes) -> bool:
-        if self._closed or self._vobiz.closed:
-            return False
-        pcm_frame = scale_pcm_volume(pcm_frame, config.TTS_VOLUME)
-        self._ulaw_out_buffer.extend(pcm_bytes_to_ulaw(pcm_frame))
-        chunk = max(160, config.VOBIZ_ULAW_PLAY_CHUNK)
-        while len(self._ulaw_out_buffer) >= chunk:
-            block = bytes(self._ulaw_out_buffer[:chunk])
-            del self._ulaw_out_buffer[:chunk]
-            await self._vobiz.play_ulaw(block)
-        return True
+        return await self._send_paced_frame(pcm_frame)
 
     async def flush_playback_output(self) -> None:
         await self._flush_ulaw_out_buffer()
 
-    async def _flush_ulaw_out_buffer(self) -> None:
-        if self._ulaw_out_buffer:
-            await self._vobiz.play_ulaw(bytes(self._ulaw_out_buffer))
-            self._ulaw_out_buffer.clear()
-
     async def _send_pcm_frame(self, pcm_frame: bytes) -> bool:
-        return await self.send_pcm_frame(pcm_frame)
+        return await self._send_paced_frame(pcm_frame)
+
+    async def _wait_play_lead(self) -> None:
+        """Stay about 120 ms ahead of playback. More than that gets dropped."""
+        if self._play_origin is None:
+            return
+        elapsed_ms = (time.monotonic() - self._play_origin) * 1000
+        ahead_ms = self._play_sent_ms - elapsed_ms
+        if ahead_ms > 120:
+            await asyncio.sleep((ahead_ms - 120) / 1000)
+
+    async def _drain_ulaw(self, *, force: bool) -> None:
+        while self._ulaw_out_buffer and not self._vobiz.closed:
+            need = 160 if self._play_sent_ms == 0 else 800
+            if len(self._ulaw_out_buffer) < need and not force:
+                return
+            take = len(self._ulaw_out_buffer) if force and len(self._ulaw_out_buffer) < need else need
+            await self._wait_play_lead()
+            block = bytes(self._ulaw_out_buffer[:take])
+            del self._ulaw_out_buffer[:take]
+            await self._vobiz.play_ulaw(block)
+            if self._play_origin is None:
+                self._play_origin = time.monotonic()
+            self._play_sent_ms += len(block) / 8.0
+            if force and not self._ulaw_out_buffer:
+                return
+
+    async def _flush_ulaw_out_buffer(self) -> None:
+        await self._drain_ulaw(force=True)
+        if self._play_origin is not None:
+            elapsed_ms = (time.monotonic() - self._play_origin) * 1000
+            remain_ms = self._play_sent_ms - elapsed_ms
+            if remain_ms > 30:
+                await asyncio.sleep(remain_ms / 1000)
+        self._play_origin = None
+        self._play_sent_ms = 0.0
 
     async def _send_paced_frame(self, frame, timeline=None, playback_started=False):
-        """Send μ-law at 20 ms per frame so Vobiz plays the whole line.
-
-        Bursting the full clip in a few milliseconds overflows the carrier
-        buffer: only the first half-second is heard, then the line cuts.
-        """
-        return await super()._send_paced_frame(frame, timeline, playback_started)
+        """Queue TTS and let Vobiz hear the whole sentence, not just the start."""
+        if self._closed or self._vobiz.closed or not frame:
+            return False
+        self._ulaw_out_buffer.extend(
+            pcm_bytes_to_ulaw(scale_pcm_volume(frame, config.TTS_VOLUME))
+        )
+        await self._drain_ulaw(force=False)
+        if timeline is not None:
+            timeline.mark_once("first_packet_sent_ms")
+            timeline.mark("last_packet_sent_ms")
+        return True
 
     def _arm_echo_guard(self) -> None:
         loop = asyncio.get_running_loop()
@@ -91,7 +119,7 @@ class VobizCompoundSession(CompoundPipelineSession):
 
     async def _debounced_finish_playback(self) -> None:
         try:
-            await asyncio.sleep(0.25)
+            await asyncio.sleep(0.05)
             await self._vobiz_finish_playback()
         except asyncio.CancelledError:
             raise
@@ -112,6 +140,8 @@ class VobizCompoundSession(CompoundPipelineSession):
 
     async def _send_clear(self) -> None:
         self._ulaw_out_buffer.clear()
+        self._play_origin = None
+        self._play_sent_ms = 0.0
         await self._vobiz.clear()
 
     async def handle_clear(self) -> None:

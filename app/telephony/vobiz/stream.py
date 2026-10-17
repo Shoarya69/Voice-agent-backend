@@ -63,7 +63,9 @@ class VobizStream:
         if not self.stream_id:
             logger.warning("Vobiz play_ulaw skipped — streamId not set yet")
             return
-        chunk = max(ULAW_FRAME_20MS, config.VOBIZ_ULAW_PLAY_CHUNK)
+        # Keep a 100 ms block as one playAudio. Splitting it into 20 ms
+        # events makes Vobiz drop the rest of the sentence.
+        chunk = len(audio) if len(audio) <= 1600 else max(ULAW_FRAME_20MS, 800)
         for i in range(0, len(audio), chunk):
             block = audio[i : i + chunk]
             await self._send(

@@ -625,7 +625,10 @@ async def handle_websocket(websocket):
 
 
 async def _probe_elevenlabs_api_key() -> None:
-    if not config.ELEVENLABS_API_KEY or config.VOICE_PIPELINE == "openai_realtime":
+    if (
+        not config.ELEVENLABS_API_KEY
+        or config.VOICE_PIPELINE in ("openai_realtime", "gemini_live")
+    ):
         return
     import httpx
 
@@ -658,9 +661,10 @@ async def main():
 
     await _probe_elevenlabs_api_key()
 
-    from app.streaming.warm_pool import warm_on_process_start
+    if config.VOICE_PIPELINE != "gemini_live":
+        from app.streaming.warm_pool import warm_on_process_start
 
-    await warm_on_process_start()
+        await warm_on_process_start()
 
     logger.info("🚀 Starting AI Voice Agent Server...")
     logger.info("📡 Listening on %s:%s", config.HOST, config.PORT)
@@ -693,6 +697,12 @@ async def main():
             config.MAX_CONCURRENT_STT,
             config.MAX_CONCURRENT_TTS,
             config.VAD_WORKER_THREADS,
+        )
+    elif pipeline == "gemini_live":
+        logger.info(
+            "🧠 Gemini Live: model '%s' voice '%s' (no ElevenLabs, no ChatGPT)",
+            config.GEMINI_LIVE_MODEL,
+            config.GEMINI_LIVE_VOICE,
         )
     elif pipeline == "openai_realtime":
         logger.info(

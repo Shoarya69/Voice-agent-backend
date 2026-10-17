@@ -119,7 +119,21 @@ HTTP_KEEPALIVE_EXPIRY = _get_float("HTTP_KEEPALIVE_EXPIRY", 30.0)
 # ---------------------------------------------------------------------------
 # compound         — ElevenLabs Realtime STT → OpenAI stream → ElevenLabs WS TTS (default)
 # openai_realtime  — OpenAI Realtime API (speech-to-speech)
+# gemini_live      — Gemini Native Multimodal Live API (speech-to-speech)
 VOICE_PIPELINE = os.getenv("VOICE_PIPELINE", "compound").strip().lower()
+
+# Gemini Live (only when VOICE_PIPELINE=gemini_live)
+GEMINI_API_KEY = (os.getenv("GEMINI_API_KEY", "") or os.getenv("GOOGLE_API_KEY", "")).strip()
+GEMINI_LIVE_MODEL = os.getenv(
+    "GEMINI_LIVE_MODEL", "gemini-live-2.5-flash-native-audio"
+).strip()
+GEMINI_LIVE_VOICE = os.getenv("GEMINI_LIVE_VOICE", "Kore").strip()
+GEMINI_LIVE_WS_URL = os.getenv(
+    "GEMINI_LIVE_WS_URL",
+    "wss://generativelanguage.googleapis.com/ws/"
+    "google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent",
+).strip()
+GEMINI_LIVE_SILENCE_MS = _get_int("GEMINI_LIVE_SILENCE_MS", 400)
 
 # OpenAI Realtime (only when VOICE_PIPELINE=openai_realtime)
 OPENAI_REALTIME_MODEL = os.getenv("OPENAI_REALTIME_MODEL", "gpt-realtime-2.1")
@@ -367,11 +381,15 @@ def validate() -> list:
     """Return a list of human-readable warnings for missing/invalid config."""
     warnings = []
     pipeline = VOICE_PIPELINE or "compound"
-    if pipeline not in ("compound", "openai_realtime"):
+    if pipeline not in ("compound", "openai_realtime", "gemini_live"):
         warnings.append(
             f"VOICE_PIPELINE={pipeline!r} is unknown — will fall back to compound at runtime."
         )
-    if not OPENAI_API_KEY:
+    if pipeline == "gemini_live" and not GEMINI_API_KEY:
+        warnings.append(
+            "GEMINI_API_KEY is not set — Gemini Live calls cannot speak or hear."
+        )
+    if pipeline != "gemini_live" and not OPENAI_API_KEY:
         warnings.append("OPENAI_API_KEY is not set - the agent will not be able to think/respond.")
     elif pipeline == "openai_realtime":
         pass  # key present — Realtime can run without ElevenLabs

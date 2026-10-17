@@ -20,6 +20,7 @@ from app.runtime import (
 )
 from app.agent_setup import load_agent_bundle_into_session
 from app.telephony.vobiz.metadata import extract_call_sid, extract_parties, extract_stream_id
+from app.telephony.vobiz.gemini_session import VobizGeminiLiveSession
 from app.telephony.vobiz.session import VobizCompoundSession
 from app.telephony.vobiz.stream import VobizStream
 
@@ -70,7 +71,10 @@ async def handle_vobiz_websocket(websocket) -> None:
         )
 
         vobiz = VobizStream(websocket)
-        session = VobizCompoundSession(connection_id, websocket, vobiz)
+        if config.VOICE_PIPELINE == "gemini_live":
+            session = VobizGeminiLiveSession(connection_id, websocket, vobiz)
+        else:
+            session = VobizCompoundSession(connection_id, websocket, vobiz)
         session.telephony_provider = "vobiz"
         session.wss_route_kind, session.wss_route_value, request_path = (
             voice_server._extract_wss_route(websocket)

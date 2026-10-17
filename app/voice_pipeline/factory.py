@@ -14,6 +14,7 @@ logger = logging.getLogger(__name__)
 _REGISTERED_PIPELINES: dict[str, str] = {
     "compound": "app.voice_pipeline.compound.session.CompoundPipelineSession",
     "openai_realtime": "app.voice_pipeline.openai_realtime.session.OpenAIRealtimePipelineSession",
+    "gemini_live": "app.voice_pipeline.gemini_live.session.GeminiLivePipelineSession",
 }
 
 
