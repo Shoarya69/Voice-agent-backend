@@ -63,15 +63,11 @@ class GeminiLivePipelineSession(VoicePipelineSession):
             return
         await self._ensure_link()
         self._is_playing_welcome = True
-        try:
-            await self._link.say(
-                "The phone call just connected. Say this greeting in a natural voice, "
-                f"then stop and wait: {welcome}"
-            )
-            await self._link.wait_turn(12)
-        finally:
-            self._is_playing_welcome = False
-            self.is_speaking = False
+        self.is_speaking = True
+        await self._link.say(
+            "The phone call just connected. Say this greeting in a natural voice, "
+            f"then stop and wait: {welcome}"
+        )
 
     async def handle_clear(self) -> None:
         await self._on_interrupt()
@@ -112,10 +108,12 @@ class GeminiLivePipelineSession(VoicePipelineSession):
         if self._out_residual:
             await self.send_pcm_frame(bytes(self._out_residual))
             self._out_residual.clear()
+        self._is_playing_welcome = False
         self.is_speaking = False
 
     async def _on_interrupt(self) -> None:
         self._out_residual.clear()
         self._out_state = None
+        self._is_playing_welcome = False
         self.is_speaking = False
         await self.send_exotel_clear()

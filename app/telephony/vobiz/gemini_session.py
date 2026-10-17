@@ -38,6 +38,12 @@ class VobizGeminiLiveSession(VobizCompoundSession):
             on_turn_complete=self._on_turn_complete,
         )
 
+    async def warm_playback_pipeline(self) -> None:
+        try:
+            await self._ensure_link()
+        except Exception as exc:
+            logger.warning("Gemini Live prewarm failed conn=%s: %s", self.connection_id, exc)
+
     async def on_agent_ready(self) -> None:
         await self._ensure_link()
 
@@ -70,17 +76,13 @@ class VobizGeminiLiveSession(VobizCompoundSession):
             return
         self.history.append({"role": "assistant", "content": welcome})
         self._is_playing_welcome = True
-        try:
-            await self._link.say(
-                "The phone call just connected. Say this greeting naturally, "
-                f"then wait for the caller: {welcome}"
-            )
-            await self._link.wait_turn(12)
-        finally:
-            self._is_playing_welcome = False
-            self.is_speaking = False
-            await self.flush_playback_output()
-            self._arm_echo_guard()
+        self.is_speaking = True
+        # Do not block the Vobiz websocket reader on a 6-second greeting turn,
+        # or Vobiz drops the stream while inbound media goes unread.
+        await self._link.say(
+            "The phone call just connected. Say this greeting naturally, "
+            f"then wait for the caller: {welcome}"
+        )
 
     async def handle_clear(self) -> None:
         await self._on_interrupt()
@@ -123,6 +125,7 @@ class VobizGeminiLiveSession(VobizCompoundSession):
             await self._send_paced_frame(bytes(self._out_residual))
             self._out_residual.clear()
         await self.flush_playback_output()
+        self._is_playing_welcome = False
         self.is_speaking = False
         self._arm_echo_guard()
 
@@ -132,5 +135,6 @@ class VobizGeminiLiveSession(VobizCompoundSession):
         self._ulaw_out_buffer.clear()
         self._play_origin = None
         self._play_sent_ms = 0.0
+        self._is_playing_welcome = False
         self.is_speaking = False
         await self._send_clear()
