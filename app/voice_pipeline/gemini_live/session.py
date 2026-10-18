@@ -6,6 +6,7 @@ Exotel session for Gemini Live.
 
 from __future__ import annotations
 
+import asyncio
 import audioop
 import logging
 from typing import ClassVar
@@ -14,7 +15,12 @@ from app import config
 from app.audio_utils import decode_payload
 from app.openai_service import openai_brain
 from app.voice_pipeline.base import VoicePipelineSession
+from app.voice_pipeline.gemini_live.call_end import (
+    assistant_sounds_like_closing,
+    user_requested_hangup,
+)
 from app.voice_pipeline.gemini_live.link import GeminiLiveLink
+from app.voice_pipeline.tools import gemini_live_system_instructions
 
 logger = logging.getLogger(__name__)
 
@@ -31,12 +37,14 @@ class GeminiLivePipelineSession(VoicePipelineSession):
         self._in_state = None
         self._out_state = None
         self._out_residual = bytearray()
+        self._caller_wants_hangup = False
         self._link = GeminiLiveLink(
             connection_id,
             on_audio=self._on_model_audio,
             on_transcript=self._on_transcript,
             on_interrupt=self._on_interrupt,
             on_turn_complete=self._on_turn_complete,
+            on_end_call=self._on_end_call_tool,
         )
 
     async def on_agent_ready(self) -> None:
@@ -79,8 +87,8 @@ class GeminiLivePipelineSession(VoicePipelineSession):
     async def _ensure_link(self) -> None:
         if self._link.ready:
             return
-        instructions = openai_brain._messages([])[0]["content"]
-        await self._link.connect(instructions)
+        base = openai_brain._messages([])[0]["content"]
+        await self._link.connect(gemini_live_system_instructions(base))
 
     async def _on_model_audio(self, pcm_24k: bytes) -> None:
         if self._closed or not pcm_24k:
@@ -97,12 +105,27 @@ class GeminiLivePipelineSession(VoicePipelineSession):
             if not await self.send_pcm_frame(chunk):
                 return
 
+    async def _on_end_call_tool(self) -> None:
+        self._should_end_call = True
+        logger.info("Gemini Live end_call tool conn=%s", self.connection_id)
+
     async def _on_transcript(self, role: str, text: str) -> None:
+        if role == "user" and user_requested_hangup(text):
+            self._caller_wants_hangup = True
         cleaned = self._strip_call_end_marker(text) if role == "assistant" else text
         self._append_history_message(role, cleaned)
         logger.info("Gemini Live %s (%s): %s", role, self.connection_id, cleaned[:160])
-        if role == "assistant":
-            self._schedule_close_after_playback_if_needed()
+        if role == "assistant" and self._caller_wants_hangup and assistant_sounds_like_closing(
+            cleaned
+        ):
+            self._should_end_call = True
+
+    async def _await_outbound_playback(self) -> None:
+        if self._out_residual:
+            await self.send_pcm_frame(bytes(self._out_residual))
+            self._out_residual.clear()
+        # ~20 ms per Exotel frame already sent; small tail for carrier buffer.
+        await asyncio.sleep(0.35)
 
     async def _on_turn_complete(self) -> None:
         if self._out_residual:
@@ -110,6 +133,14 @@ class GeminiLivePipelineSession(VoicePipelineSession):
             self._out_residual.clear()
         self._is_playing_welcome = False
         self.is_speaking = False
+        if (
+            not self._should_end_call
+            and self._caller_wants_hangup
+            and self.history
+            and self.history[-1]["role"] == "assistant"
+        ):
+            self._should_end_call = True
+        self._schedule_close_after_playback_if_needed()
 
     async def _on_interrupt(self) -> None:
         self._out_residual.clear()

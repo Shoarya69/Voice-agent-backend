@@ -196,6 +196,18 @@ CALL_END_INSTRUCTION = (
     f"within the word limit and append {CALL_END_MARKER} at the very end. "
     "Never speak or explain this marker."
 )
+# Gemini Live speaks audio only — use the end_call tool instead of the text marker.
+GEMINI_LIVE_CALL_END_INSTRUCTION = os.getenv(
+    "GEMINI_LIVE_CALL_END_INSTRUCTION",
+    (
+        "MANDATORY hangup rule: when the caller wants to end the call "
+        "(bye, goodbye, disconnect, call cut, band karo, call end kar do, "
+        "thanks that's all, bas itna hi), first say ONE short polite closing "
+        "sentence in their language, then immediately invoke the end_call function "
+        "to hang up. Do not invoke end_call before your goodbye. "
+        "Do not continue chatting after invoking end_call."
+    ),
+)
 CALL_BEHAVIOR_INSTRUCTION = (
     "MANDATORY (overrides conflicting instructions above): "
     "Talk like a person on a live phone call, in the same language the caller just used. "

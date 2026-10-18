@@ -16,12 +16,14 @@ import websockets
 import websockets.exceptions
 
 from app import config
+from app.voice_pipeline.tools import END_CALL_TOOL_NAME, build_gemini_live_tools
 
 logger = logging.getLogger(__name__)
 
 AudioHandler = Callable[[bytes], Awaitable[None]]
 TextHandler = Callable[[str, str], Awaitable[None]]
 InterruptHandler = Callable[[], Awaitable[None]]
+EndCallHandler = Callable[[], Awaitable[None]]
 
 
 class GeminiLiveLink:
@@ -35,12 +37,14 @@ class GeminiLiveLink:
         on_transcript: TextHandler | None = None,
         on_interrupt: InterruptHandler | None = None,
         on_turn_complete: Callable[[], Awaitable[None]] | None = None,
+        on_end_call: EndCallHandler | None = None,
     ) -> None:
         self._connection_id = connection_id
         self._on_audio = on_audio
         self._on_transcript = on_transcript
         self._on_interrupt = on_interrupt
         self._on_turn_complete = on_turn_complete
+        self._on_end_call = on_end_call
         self._ws = None
         self._reader: asyncio.Task | None = None
         self._setup_done = asyncio.Event()
@@ -102,6 +106,7 @@ class GeminiLiveLink:
                             "silenceDurationMs": config.GEMINI_LIVE_SILENCE_MS,
                         }
                     },
+                    "tools": build_gemini_live_tools(),
                 }
             }
         )
@@ -256,6 +261,11 @@ class GeminiLiveLink:
             logger.warning("Gemini Live goAway conn=%s", self._connection_id)
             return
 
+        tool_call = message.get("toolCall")
+        if tool_call:
+            await self._handle_tool_call(tool_call)
+            return
+
         content = message.get("serverContent") or {}
         if content.get("interrupted"):
             self._turn_done.set()
@@ -273,6 +283,13 @@ class GeminiLiveLink:
 
         model_turn = content.get("modelTurn") or {}
         for part in model_turn.get("parts") or []:
+            fn = part.get("functionCall") or part.get("function_call")
+            if fn:
+                await self._handle_function_call(fn)
+                continue
+            text_part = (part.get("text") or "").strip()
+            if text_part and self._on_transcript is not None:
+                await self._on_transcript("assistant", text_part)
             inline = part.get("inlineData") or part.get("inline_data") or {}
             data = inline.get("data")
             if not data:
@@ -286,6 +303,47 @@ class GeminiLiveLink:
             self._turn_done.set()
             if self._on_turn_complete is not None and content.get("turnComplete"):
                 await self._on_turn_complete()
+
+    async def _handle_tool_call(self, tool_call: dict) -> None:
+        calls = tool_call.get("functionCalls") or tool_call.get("function_calls") or []
+        if not calls:
+            return
+        responses: list[dict] = []
+        for fn in calls:
+            name = fn.get("name") or ""
+            call_id = fn.get("id") or ""
+            if name == END_CALL_TOOL_NAME and self._on_end_call is not None:
+                await self._on_end_call()
+            responses.append(
+                {
+                    "id": call_id,
+                    "name": name,
+                    "response": {"result": "ok"},
+                }
+            )
+        if responses:
+            await self._send({"toolResponse": {"functionResponses": responses}})
+
+    async def _handle_function_call(self, fn: dict) -> None:
+        name = fn.get("name") or ""
+        if name != END_CALL_TOOL_NAME or self._on_end_call is None:
+            return
+        await self._on_end_call()
+        call_id = fn.get("id") or ""
+        if call_id:
+            await self._send(
+                {
+                    "toolResponse": {
+                        "functionResponses": [
+                            {
+                                "id": call_id,
+                                "name": name,
+                                "response": {"result": "ok"},
+                            }
+                        ]
+                    }
+                }
+            )
 
 
 def _transcript_text(node) -> str:

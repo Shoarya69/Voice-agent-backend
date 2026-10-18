@@ -94,9 +94,28 @@ class VoicePipelineSession(ABC):
         self.history.append({"role": role, "content": content})
         self._trim_history()
 
+    async def _await_outbound_playback(self) -> None:
+        """Wait until queued telephony audio has finished (override in subclasses)."""
+
     async def _close_after_final_reply(self) -> None:
-        """Close the Exotel media stream after the assistant finishes speaking."""
+        """Close the media stream after the assistant finishes speaking."""
+        if self._closed:
+            return
+        try:
+            await self._await_outbound_playback()
+        except Exception as exc:
+            logger.warning(
+                "Playback wait before hangup failed for %s: %s",
+                self.connection_id,
+                exc,
+            )
+        if self._closed:
+            return
         self._closed = True
+        logger.info(
+            "☎️ Hanging up call %s (assistant end-call)",
+            self.connection_id,
+        )
         try:
             await self.websocket.close(code=1000, reason="assistant ended call")
         except Exception as exc:

@@ -20,7 +20,12 @@ from app.audio_utils import (
 )
 from app.openai_service import openai_brain
 from app.telephony.vobiz.session import VobizCompoundSession
+from app.voice_pipeline.gemini_live.call_end import (
+    assistant_sounds_like_closing,
+    user_requested_hangup,
+)
 from app.voice_pipeline.gemini_live.link import GeminiLiveLink
+from app.voice_pipeline.tools import gemini_live_system_instructions
 
 logger = logging.getLogger(__name__)
 
@@ -36,12 +41,14 @@ class VobizGeminiLiveSession(VobizCompoundSession):
         self._out_state = None
         self._out_residual = bytearray()
         self._greeting_started = False
+        self._caller_wants_hangup = False
         self._link = GeminiLiveLink(
             connection_id,
             on_audio=self._on_model_audio,
             on_transcript=self._on_transcript,
             on_interrupt=self._on_interrupt,
             on_turn_complete=self._on_turn_complete,
+            on_end_call=self._on_end_call_tool,
         )
 
     async def preconnect_socket(self) -> None:
@@ -118,8 +125,8 @@ class VobizGeminiLiveSession(VobizCompoundSession):
     async def _ensure_link(self) -> None:
         if self._link.ready:
             return
-        instructions = openai_brain._messages([])[0]["content"]
-        await self._link.connect(instructions)
+        base = openai_brain._messages([])[0]["content"]
+        await self._link.connect(gemini_live_system_instructions(base))
 
     async def _on_model_audio(self, pcm_24k: bytes) -> None:
         if self._closed or not pcm_24k:
@@ -142,13 +149,27 @@ class VobizGeminiLiveSession(VobizCompoundSession):
             if not await self._send_paced_frame(chunk):
                 return
 
+    async def _on_end_call_tool(self) -> None:
+        self._should_end_call = True
+        logger.info("Gemini Live end_call tool conn=%s", self.connection_id)
+
     async def _on_transcript(self, role: str, text: str) -> None:
+        if role == "user" and user_requested_hangup(text):
+            self._caller_wants_hangup = True
         cleaned = self._strip_call_end_marker(text) if role == "assistant" else text
         if role == "assistant" and self.history and self.history[-1]["role"] == "assistant":
             if self.history[-1]["content"] == cleaned:
                 return
         self._append_history_message(role, cleaned)
         logger.info("Gemini Live %s (%s): %s", role, self.connection_id, cleaned[:160])
+        if role == "assistant" and self._caller_wants_hangup and assistant_sounds_like_closing(
+            cleaned
+        ):
+            self._should_end_call = True
+
+    async def _await_outbound_playback(self) -> None:
+        await self.flush_playback_output()
+        await self._vobiz_finish_playback()
 
     async def _on_turn_complete(self) -> None:
         if self._out_residual:
@@ -158,6 +179,14 @@ class VobizGeminiLiveSession(VobizCompoundSession):
         self._is_playing_welcome = False
         self.is_speaking = False
         self._arm_echo_guard()
+        if (
+            not self._should_end_call
+            and self._caller_wants_hangup
+            and self.history
+            and self.history[-1]["role"] == "assistant"
+        ):
+            self._should_end_call = True
+        self._schedule_close_after_playback_if_needed()
 
     async def _on_interrupt(self) -> None:
         self._out_residual.clear()
