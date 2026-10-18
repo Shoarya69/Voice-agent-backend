@@ -132,26 +132,12 @@ class GeminiLivePipelineSession(VoicePipelineSession):
     async def add_audio_chunk(self, media_data: dict) -> None:
         if self._closed or not self._link.ready:
             return
-        if (self.is_speaking or self._is_playing_welcome) and self._last_model_audio_at > 0:
-            if (time.monotonic() - self._last_model_audio_at) > 0.6:
-                self.is_speaking = False
-                self._is_playing_welcome = False
-                self._barge_in.on_assistant_turn_complete()
         pcm_8k = decode_payload(media_data.get("payload", ""))
         if not pcm_8k:
             return
         pcm_16k, self._in_state = audioop.ratecv(
             pcm_8k, 2, 1, 8000, 16000, self._in_state
         )
-        if self.is_speaking or self._is_playing_welcome:
-            should_interrupt, frames_to_send = (
-                self._barge_in.process_caller_frame_during_playback(pcm_8k, pcm_16k)
-            )
-            if should_interrupt:
-                await self._on_interrupt(local_barge_in=True)
-                for chunk_16k in frames_to_send:
-                    await self._link.send_pcm16k(chunk_16k)
-            return
         self._drop_model_audio_until_next_turn = False
         await self._link.send_pcm16k(pcm_16k)
 

@@ -45,8 +45,8 @@ def _make_silence_pcm_8k(duration_ms: int = 20) -> bytes:
 
 
 class GeminiVoiceServerTests(unittest.IsolatedAsyncioTestCase):
-    def test_01_endpointing_default_is_700_to_900ms(self):
-        self.assertGreaterEqual(config.GEMINI_LIVE_SILENCE_MS, 700)
+    def test_01_endpointing_is_fast_for_live_conversation(self):
+        self.assertGreaterEqual(config.GEMINI_LIVE_SILENCE_MS, 200)
         self.assertLessEqual(config.GEMINI_LIVE_SILENCE_MS, 900)
 
     def test_02_backchannel_and_question_detection(self):

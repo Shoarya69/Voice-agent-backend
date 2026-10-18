@@ -97,21 +97,25 @@ class GeminiLiveLink:
             max_size=16 * 1024 * 1024,
         )
 
-    async def _send_Setup(self, instructions: str) -> None:
+    async def _send_Setup(self, instructions: str, *, disable_thinking: bool = True) -> None:
+        gen_cfg: dict = {
+            "responseModalities": ["AUDIO"],
+            "speechConfig": {
+                "voiceConfig": {
+                    "prebuiltVoiceConfig": {
+                        "voiceName": config.GEMINI_LIVE_VOICE,
+                    }
+                }
+            },
+        }
+        if disable_thinking:
+            gen_cfg["thinkingConfig"] = {"thinkingBudget": 0}
+
         await self._send(
             {
                 "setup": {
                     "model": f"models/{config.GEMINI_LIVE_MODEL}",
-                    "generationConfig": {
-                        "responseModalities": ["AUDIO"],
-                        "speechConfig": {
-                            "voiceConfig": {
-                                "prebuiltVoiceConfig": {
-                                    "voiceName": config.GEMINI_LIVE_VOICE,
-                                }
-                            }
-                        },
-                    },
+                    "generationConfig": gen_cfg,
                     "systemInstruction": {
                         "parts": [{"text": instructions}],
                     },
@@ -119,9 +123,11 @@ class GeminiLiveLink:
                     "outputAudioTranscription": {},
                     "realtimeInputConfig": {
                         "automaticActivityDetection": {
+                            "endOfSpeechSensitivity": "END_SENSITIVITY_HIGH",
                             "silenceDurationMs": config.GEMINI_LIVE_SILENCE_MS,
                             "prefixPaddingMs": config.GEMINI_LIVE_PREFIX_PADDING_MS,
-                        }
+                        },
+                        "activityHandling": "START_OF_ACTIVITY_INTERRUPTS",
                     },
                     "tools": build_gemini_live_tools(),
                 }
@@ -162,7 +168,7 @@ class GeminiLiveLink:
                     max_size=16 * 1024 * 1024,
                 )
                 self._reader = asyncio.create_task(self._read_loop())
-                await self._send_Setup(instructions)
+                await self._send_Setup(instructions, disable_thinking=False)
                 await asyncio.wait_for(self._setup_done.wait(), timeout=6.0)
             if not self._setup_ok or self._ws is None:
                 raise RuntimeError(

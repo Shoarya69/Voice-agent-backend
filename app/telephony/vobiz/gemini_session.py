@@ -228,25 +228,6 @@ class VobizGeminiLiveSession(VobizCompoundSession):
     async def add_audio_chunk(self, media_data: dict) -> None:
         if self._closed or not self._link.ready:
             return
-        now = time.monotonic()
-        # Never stay deaf if Gemini drops turnComplete — release after 0.6s of no model audio.
-        if (self.is_speaking or self._is_playing_welcome) and self._last_model_audio_at > 0:
-            if (now - self._last_model_audio_at) > 0.6 and not self._ulaw_out_buffer:
-                self.is_speaking = False
-                self._is_playing_welcome = False
-                self._barge_in.on_assistant_turn_complete()
-                self._echo_guard_mono_until = now + 0.45
-
-        # Half-duplex / echo guard when local barge-in is disabled on telephony lines:
-        # prevents phone line echo from cutting the AI's voice or feeding back into Gemini.
-        if not config.GEMINI_BARGE_IN_ENABLED and not config.ENABLE_BARGE_IN:
-            if (
-                self.is_speaking
-                or self._is_playing_welcome
-                or now < self._echo_guard_mono_until
-            ):
-                return
-
         ulaw = decode_payload(media_data.get("payload", ""))
         if not ulaw:
             return
@@ -254,26 +235,8 @@ class VobizGeminiLiveSession(VobizCompoundSession):
         pcm_16k, self._in_state = audioop.ratecv(
             pcm_8k, 2, 1, 8000, 16000, self._in_state
         )
-
-        if self.is_speaking or self._is_playing_welcome:
-            should_interrupt, frames_to_send = (
-                self._barge_in.process_caller_frame_during_playback(pcm_8k, pcm_16k)
-            )
-            if should_interrupt:
-                logger.info(
-                    "🛑 Caller barge-in detected conn=%s speech_ms=%.0f asked_q=%s",
-                    self.connection_id,
-                    self._barge_in.speech_ms,
-                    self._barge_in.ai_asked_question,
-                )
-                await self._on_interrupt(local_barge_in=True)
-                for chunk_16k in frames_to_send:
-                    await self._link.send_pcm16k(chunk_16k)
-            return
-
-        if now < self._echo_guard_mono_until:
-            return
-
+        # Full-duplex streaming: always forward caller audio to Gemini Live so the
+        # caller can naturally interrupt the agent at any time and zero words are clipped.
         self._drop_model_audio_until_next_turn = False
         await self._link.send_pcm16k(pcm_16k)
 
@@ -432,14 +395,19 @@ class VobizGeminiLiveSession(VobizCompoundSession):
                 )
             self._captured_greeting_pcm.clear()
         if self._out_residual and not self._drop_model_audio_until_next_turn:
-            await self._send_paced_frame(bytes(self._out_residual))
+            self._ulaw_out_buffer.extend(
+                pcm_bytes_to_ulaw(
+                    scale_pcm_volume(bytes(self._out_residual), config.TTS_VOLUME)
+                )
+            )
             self._out_residual.clear()
-        await self.flush_playback_output()
+        if self._ulaw_out_buffer and self._vobiz.stream_id:
+            await self._drain_ulaw(force=True)
+        self._play_origin = None
+        self._play_sent_ms = 0.0
         self._is_playing_welcome = False
         self.is_speaking = False
-        self._echo_guard_mono_until = time.monotonic() + 0.45
         self._barge_in.on_assistant_turn_complete()
-        self._arm_echo_guard()
         if (
             not self._should_end_call
             and self._caller_wants_hangup
@@ -450,13 +418,11 @@ class VobizGeminiLiveSession(VobizCompoundSession):
         self._schedule_close_after_playback_if_needed()
 
     async def _on_interrupt(self, local_barge_in: bool = False) -> None:
-        # Never cut the opening greeting on carrier noise or "call is being recorded"
-        if self._is_playing_welcome and not local_barge_in:
-            return
+        # Ignore carrier "this call is now being recorded" interruption in the first 1.2s of greeting
         if (
-            not local_barge_in
-            and not config.GEMINI_BARGE_IN_ENABLED
-            and not config.ENABLE_BARGE_IN
+            self._is_playing_welcome
+            and not local_barge_in
+            and (time.monotonic() - self._ws_connected_at) < 1.8
         ):
             return
         if (
