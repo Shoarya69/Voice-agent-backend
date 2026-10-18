@@ -661,10 +661,9 @@ async def main():
 
     await _probe_elevenlabs_api_key()
 
-    if config.VOICE_PIPELINE != "gemini_live":
-        from app.streaming.warm_pool import warm_on_process_start
+    from app.streaming.warm_pool import warm_on_process_start
 
-        await warm_on_process_start()
+    await warm_on_process_start()
 
     logger.info("🚀 Starting AI Voice Agent Server...")
     logger.info("📡 Listening on %s:%s", config.HOST, config.PORT)

@@ -12,7 +12,12 @@ import logging
 from typing import ClassVar
 
 from app import config
-from app.audio_utils import decode_payload, ulaw_bytes_to_pcm
+from app.audio_utils import (
+    decode_payload,
+    pcm_bytes_to_ulaw,
+    scale_pcm_volume,
+    ulaw_bytes_to_pcm,
+)
 from app.openai_service import openai_brain
 from app.telephony.vobiz.session import VobizCompoundSession
 from app.voice_pipeline.gemini_live.link import GeminiLiveLink
@@ -30,6 +35,7 @@ class VobizGeminiLiveSession(VobizCompoundSession):
         self._in_state = None
         self._out_state = None
         self._out_residual = bytearray()
+        self._greeting_started = False
         self._link = GeminiLiveLink(
             connection_id,
             on_audio=self._on_model_audio,
@@ -38,14 +44,25 @@ class VobizGeminiLiveSession(VobizCompoundSession):
             on_turn_complete=self._on_turn_complete,
         )
 
+    async def preconnect_socket(self) -> None:
+        """Open Gemini socket in parallel with Supabase agent lookup."""
+        try:
+            await self._link.open_socket()
+        except Exception as exc:
+            logger.debug("Gemini early socket open skipped conn=%s: %s", self.connection_id, exc)
+
     async def warm_playback_pipeline(self) -> None:
+        """Connect Gemini and start synthesizing greeting BEFORE Vobiz `start` arrives."""
         try:
             await self._ensure_link()
+            await self._start_greeting_if_needed()
         except Exception as exc:
             logger.warning("Gemini Live prewarm failed conn=%s: %s", self.connection_id, exc)
 
     async def on_agent_ready(self) -> None:
         await self._ensure_link()
+        if self._ulaw_out_buffer and self._vobiz.stream_id:
+            await self._drain_ulaw(force=False)
 
     async def add_audio_chunk(self, media_data: dict) -> None:
         if self._closed or not self._link.ready:
@@ -61,28 +78,35 @@ class VobizGeminiLiveSession(VobizCompoundSession):
         )
         await self._link.send_pcm16k(pcm_16k)
 
-    async def speak_welcome(self) -> None:
+    async def _start_greeting_if_needed(self) -> None:
+        if self._greeting_started:
+            return
         welcome = self._welcome_text()
         if not welcome.strip():
             return
+        self._greeting_started = True
+        self.history.append({"role": "assistant", "content": welcome})
+        self._is_playing_welcome = True
+        self.is_speaking = True
+        await self._link.say(
+            "The phone call just connected. Say this greeting naturally, "
+            f"then wait for the caller: {welcome}"
+        )
+
+    async def speak_welcome(self) -> None:
+        if self._greeting_started:
+            if self._ulaw_out_buffer and self._vobiz.stream_id:
+                await self._drain_ulaw(force=False)
+            return
         try:
             await self._ensure_link()
+            await self._start_greeting_if_needed()
         except Exception as exc:
             logger.error(
                 "Gemini Live connect failed conn=%s: %s",
                 self.connection_id,
                 exc,
             )
-            return
-        self.history.append({"role": "assistant", "content": welcome})
-        self._is_playing_welcome = True
-        self.is_speaking = True
-        # Do not block the Vobiz websocket reader on a 6-second greeting turn,
-        # or Vobiz drops the stream while inbound media goes unread.
-        await self._link.say(
-            "The phone call just connected. Say this greeting naturally, "
-            f"then wait for the caller: {welcome}"
-        )
 
     async def handle_clear(self) -> None:
         await self._on_interrupt()
@@ -109,6 +133,12 @@ class VobizGeminiLiveSession(VobizCompoundSession):
         while len(self._out_residual) >= frame:
             chunk = bytes(self._out_residual[:frame])
             del self._out_residual[:frame]
+            if not self._vobiz.stream_id:
+                # Hold pre-synthesized greeting until Vobiz sends `start` with streamId.
+                self._ulaw_out_buffer.extend(
+                    pcm_bytes_to_ulaw(scale_pcm_volume(chunk, config.TTS_VOLUME))
+                )
+                continue
             if not await self._send_paced_frame(chunk):
                 return
 

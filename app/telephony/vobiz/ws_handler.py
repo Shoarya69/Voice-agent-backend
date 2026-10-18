@@ -100,6 +100,9 @@ async def handle_vobiz_websocket(websocket) -> None:
         voice_server._assume_channel_reserved(session)
         voice_server._log_channel_reserved(session, connection_id)
         start_agent_prefetch(session, connection_id)
+        preconnect = getattr(session, "preconnect_socket", None)
+        if preconnect is not None:
+            asyncio.create_task(preconnect())
 
         # Load agent before `start` so Vobiz hears playAudio within ~1–2s (not after 6s HTTP).
         agent_preloaded = False

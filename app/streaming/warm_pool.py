@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 _maintain_task: asyncio.Task | None = None
 _tts_pool: asyncio.Queue[ElevenLabsWebSocketTTSProvider] = asyncio.Queue()
 _stt_pool: asyncio.Queue[ElevenLabsStreamingSTTProvider] = asyncio.Queue()
+_gemini_ws_pool: asyncio.Queue = asyncio.Queue()
 _pool_lock = asyncio.Lock()
 
 
@@ -199,13 +200,64 @@ async def release_stt(provider: ElevenLabsStreamingSTTProvider) -> None:
     asyncio.create_task(_top_up_stt_pool())
 
 
+async def _open_gemini_socket():
+    if not config.GEMINI_API_KEY:
+        return None
+    import websockets
+
+    url = f"{config.GEMINI_LIVE_WS_URL}?key={config.GEMINI_API_KEY}"
+    try:
+        return await websockets.connect(
+            url,
+            ping_interval=20,
+            ping_timeout=10,
+            max_size=16 * 1024 * 1024,
+        )
+    except Exception as exc:
+        logger.warning("Gemini Live socket warm failed: %s", exc)
+        return None
+
+
+async def _fill_gemini_pool() -> int:
+    if config.VOICE_PIPELINE != "gemini_live" or not config.GEMINI_API_KEY:
+        return _gemini_ws_pool.qsize()
+    target = max(1, config.VOBIZ_TTS_POOL_SIZE)
+    async with _pool_lock:
+        while _gemini_ws_pool.qsize() < target:
+            ws = await _open_gemini_socket()
+            if ws is None:
+                break
+            await _gemini_ws_pool.put(ws)
+    return _gemini_ws_pool.qsize()
+
+
+async def borrow_gemini_socket():
+    while not _gemini_ws_pool.empty():
+        try:
+            ws = _gemini_ws_pool.get_nowait()
+        except asyncio.QueueEmpty:
+            break
+        if getattr(ws, "close_code", None) is None:
+            asyncio.create_task(_fill_gemini_pool())
+            return ws
+        try:
+            await ws.close()
+        except Exception:
+            pass
+    asyncio.create_task(_fill_gemini_pool())
+    return None
+
+
 async def _maintain_loop() -> None:
     interval = max(60, config.VOBIZ_WARM_POOL_REFRESH_SEC)
     while True:
         await asyncio.sleep(interval)
         await _prime_supabase()
-        await _fill_tts_pool()
-        await _fill_stt_pool()
+        if config.VOICE_PIPELINE == "gemini_live":
+            await _fill_gemini_pool()
+        else:
+            await _fill_tts_pool()
+            await _fill_stt_pool()
 
 
 def start_background_warm_pool() -> None:
@@ -222,6 +274,22 @@ async def warm_on_process_start() -> None:
         return
 
     supabase_ok = await _prime_supabase()
+    if config.VOICE_PIPELINE == "gemini_live":
+        try:
+            from app import lovable_client
+
+            await lovable_client._get_client()
+        except Exception:
+            pass
+        gemini_slots = await _fill_gemini_pool()
+        logger.info(
+            "🔥 Gemini transport pool ready supabase=%s gemini_ws_slots=%s",
+            supabase_ok,
+            gemini_slots,
+        )
+        start_background_warm_pool()
+        return
+
     await _prime_http_clients()
     tts_slots = await _fill_tts_pool()
     stt_slots = await _fill_stt_pool()
