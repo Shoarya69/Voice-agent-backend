@@ -123,7 +123,6 @@ class GeminiLiveLink:
                     "outputAudioTranscription": {},
                     "realtimeInputConfig": {
                         "automaticActivityDetection": {
-                            "endOfSpeechSensitivity": "END_SENSITIVITY_HIGH",
                             "silenceDurationMs": config.GEMINI_LIVE_SILENCE_MS,
                             "prefixPaddingMs": config.GEMINI_LIVE_PREFIX_PADDING_MS,
                         },

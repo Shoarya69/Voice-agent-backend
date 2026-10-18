@@ -74,8 +74,8 @@ class GeminiVoiceServerTests(unittest.IsolatedAsyncioTestCase):
         pcm_8k = _make_speech_pcm_8k(20)
         pcm_16k = pcm_8k * 2
         with patch.object(config, "GEMINI_BARGE_IN_ENABLED", True), patch.object(
-            ctrl, "is_frame_speech", return_value=True
-        ):
+            config, "GEMINI_BACKCHANNEL_MAX_MS", 800
+        ), patch.object(ctrl, "is_frame_speech", return_value=True):
             # 500ms of "haan" (< 800ms) while AI is mid-explanation -> must NOT interrupt
             for _ in range(25):  # 25 * 20ms = 500ms
                 interrupted, frames = ctrl.process_caller_frame_during_playback(
@@ -119,7 +119,7 @@ class GeminiVoiceServerTests(unittest.IsolatedAsyncioTestCase):
                     flushed_frames = frames
                     break
         self.assertTrue(triggered)
-        self.assertGreaterEqual(len(flushed_frames), 16)
+        self.assertGreaterEqual(len(flushed_frames), 13)
 
     def test_05_barge_in_triggers_on_sustained_speech_during_explanation(self):
         ctrl = GeminiBargeInController()

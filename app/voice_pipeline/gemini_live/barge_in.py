@@ -180,12 +180,11 @@ class GeminiBargeInController:
             if len(self.buffered_pcm16k) > 60:
                 self.buffered_pcm16k.pop(0)
 
-            min_barge_ms = float(getattr(config, "GEMINI_BARGE_IN_MIN_SPEECH_MS", 320))
-            backchannel_max_ms = float(getattr(config, "GEMINI_BACKCHANNEL_MAX_MS", 800))
+            min_barge_ms = float(getattr(config, "GEMINI_BARGE_IN_MIN_SPEECH_MS", 260))
+            backchannel_max_ms = float(getattr(config, "GEMINI_BACKCHANNEL_MAX_MS", 400))
 
-            # If AI asked a question, >320ms of speech barges in immediately.
-            # If AI is mid-explanation, wait until speech exceeds backchannel_max_ms (800ms)
-            # so a short "haan" / "ok" / "hmm" (<800ms) does not cut off the explanation.
+            # If AI asked a question, >=260ms of speech barges in immediately.
+            # If AI is mid-explanation, caller speech >=400ms barges in immediately.
             threshold_ms = min_barge_ms if self.ai_asked_question else backchannel_max_ms
             if self.speech_ms >= threshold_ms:
                 self.barge_in_triggered = True

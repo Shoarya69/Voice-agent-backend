@@ -68,6 +68,7 @@ class VobizGeminiLiveSession(VobizCompoundSession):
         self._turn_first_audio_logged = True
         self._user_turns = 0
         self._echo_guard_mono_until = 0.0
+        self._playback_active_until_mono = 0.0
         self._capturing_greeting_pcm = False
         self._captured_greeting_pcm = bytearray()
         self._captured_greeting_key = ""
@@ -211,6 +212,31 @@ class VobizGeminiLiveSession(VobizCompoundSession):
         except Exception as exc:
             logger.warning("Gemini Live prewarm failed conn=%s: %s", self.connection_id, exc)
 
+    async def _drain_ulaw(self, *, force: bool) -> None:
+        while self._ulaw_out_buffer and not self._vobiz.closed:
+            need = 160 if self._play_sent_ms == 0 else 800
+            if len(self._ulaw_out_buffer) < need and not force:
+                return
+            take = (
+                len(self._ulaw_out_buffer)
+                if force and len(self._ulaw_out_buffer) < need
+                else need
+            )
+            await self._wait_play_lead()
+            block = bytes(self._ulaw_out_buffer[:take])
+            del self._ulaw_out_buffer[:take]
+            await self._vobiz.play_ulaw(block)
+            now = time.monotonic()
+            if self._play_origin is None:
+                self._play_origin = now
+            self._play_sent_ms += len(block) / 8.0
+            # Track exact wall-clock time when Vobiz finishes playing this audio on the phone
+            self._playback_active_until_mono = (
+                max(now, self._playback_active_until_mono) + (len(block) / 8000.0)
+            )
+            if force and not self._ulaw_out_buffer:
+                return
+
     async def on_agent_ready(self) -> None:
         if self.session_ready_ms is None:
             self.session_ready_ms = round(
@@ -235,8 +261,48 @@ class VobizGeminiLiveSession(VobizCompoundSession):
         pcm_16k, self._in_state = audioop.ratecv(
             pcm_8k, 2, 1, 8000, 16000, self._in_state
         )
-        # Full-duplex streaming: always forward caller audio to Gemini Live so the
-        # caller can naturally interrupt the agent at any time and zero words are clipped.
+
+        now = time.monotonic()
+        # Ignore carrier "this call is now being recorded" during the first 1.5s of connect
+        if (now - self._ws_connected_at) < 1.5 and self._user_turns == 0:
+            return
+
+        phone_still_playing = (
+            self.is_speaking
+            or self._is_playing_welcome
+            or now < (self._playback_active_until_mono + 0.25)
+        )
+        if phone_still_playing:
+            # Release stuck speaking flags once Vobiz playback + 250ms echo tail has elapsed
+            if (
+                not self._ulaw_out_buffer
+                and now >= (self._playback_active_until_mono + 0.25)
+                and self._last_model_audio_at > 0
+                and (now - self._last_model_audio_at) > 0.4
+            ):
+                self.is_speaking = False
+                self._is_playing_welcome = False
+                self._barge_in.on_assistant_turn_complete()
+            else:
+                # While agent audio is playing on the phone, block phone-line echo from
+                # reaching Gemini (prevents "de la" / "bien" self-interruption), BUT
+                # allow real caller speech (high RMS) to barge in and silence the agent!
+                should_interrupt, frames_to_send = (
+                    self._barge_in.process_caller_frame_during_playback(
+                        pcm_8k, pcm_16k
+                    )
+                )
+                if should_interrupt:
+                    logger.info(
+                        "🛑 Caller barge-in detected conn=%s speech_ms=%.0f",
+                        self.connection_id,
+                        self._barge_in.speech_ms,
+                    )
+                    await self._on_interrupt(local_barge_in=True)
+                    for chunk_16k in frames_to_send:
+                        await self._link.send_pcm16k(chunk_16k)
+                return
+
         self._drop_model_audio_until_next_turn = False
         await self._link.send_pcm16k(pcm_16k)
 
@@ -418,20 +484,15 @@ class VobizGeminiLiveSession(VobizCompoundSession):
         self._schedule_close_after_playback_if_needed()
 
     async def _on_interrupt(self, local_barge_in: bool = False) -> None:
-        # Ignore carrier "this call is now being recorded" interruption in the first 1.2s of greeting
-        if (
-            self._is_playing_welcome
-            and not local_barge_in
-            and (time.monotonic() - self._ws_connected_at) < 1.8
-        ):
+        # Ignore spurious Gemini server-side interrupts when we already gate echo locally
+        if not local_barge_in:
             return
         if (
             self._greeting_playback_task is not None
             and not self._greeting_playback_task.done()
         ):
             self._greeting_playback_task.cancel()
-        if local_barge_in:
-            self._drop_model_audio_until_next_turn = True
+        self._drop_model_audio_until_next_turn = True
         self._capturing_greeting_pcm = False
         self._captured_greeting_pcm.clear()
         self._barge_in.mark_interrupted()
@@ -440,6 +501,7 @@ class VobizGeminiLiveSession(VobizCompoundSession):
         self._ulaw_out_buffer.clear()
         self._play_origin = None
         self._play_sent_ms = 0.0
+        self._playback_active_until_mono = 0.0
         self._is_playing_welcome = False
         self.is_speaking = False
         await self._send_clear()
