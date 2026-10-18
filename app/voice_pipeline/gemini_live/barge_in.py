@@ -114,6 +114,8 @@ class GeminiBargeInController:
             self.barge_in_triggered = False
             self.speech_ms = 0.0
             self.silence_ms = 0.0
+            self.ai_asked_question = False
+            self.last_assistant_text = ""
             self.buffered_pcm16k.clear()
         return self.response_generation_id
 

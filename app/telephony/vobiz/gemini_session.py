@@ -8,7 +8,10 @@ Playback uses the same paced playAudio path as the compound Vobiz session.
 from __future__ import annotations
 
 import asyncio
+import base64
+import json
 import logging
+import os
 import time
 from typing import TYPE_CHECKING, ClassVar
 
@@ -39,9 +42,48 @@ from app.voice_pipeline.tools import gemini_live_system_instructions
 
 logger = logging.getLogger(__name__)
 
-# Cache synthesized 8 kHz PCM greetings by welcome text so subsequent calls
-# play the greeting immediately (<300ms) without waiting for Gemini synthesis.
+# Cache synthesized 8 kHz PCM greetings by welcome text (in RAM + logs/ disk cache)
+# so even the first call after a container restart plays the greeting in <200ms.
+_GREETING_DISK_CACHE_PATH = os.path.join("logs", "gemini_greeting_cache.json")
 _synthesized_greeting_pcm_cache: dict[str, bytes] = {}
+
+
+def _load_greeting_disk_cache() -> None:
+    try:
+        if not os.path.exists(_GREETING_DISK_CACHE_PATH):
+            return
+        with open(_GREETING_DISK_CACHE_PATH, encoding="utf-8") as fh:
+            data = json.load(fh)
+        if isinstance(data, dict):
+            for k, b64 in data.items():
+                if isinstance(k, str) and isinstance(b64, str) and b64:
+                    _synthesized_greeting_pcm_cache[k] = base64.b64decode(b64)
+        if _synthesized_greeting_pcm_cache:
+            logger.info(
+                "🎵 Loaded %s cached Gemini greetings from disk",
+                len(_synthesized_greeting_pcm_cache),
+            )
+    except Exception as exc:
+        logger.debug("Greeting disk cache load skipped: %s", exc)
+
+
+def save_synthesized_greeting_pcm(welcome_text: str, pcm_8k: bytes) -> None:
+    if not welcome_text or not pcm_8k or len(pcm_8k) < 3200:
+        return
+    _synthesized_greeting_pcm_cache[welcome_text] = pcm_8k
+    try:
+        os.makedirs(os.path.dirname(_GREETING_DISK_CACHE_PATH), exist_ok=True)
+        serialized = {
+            k: base64.b64encode(v).decode("ascii")
+            for k, v in list(_synthesized_greeting_pcm_cache.items())[-25:]
+        }
+        with open(_GREETING_DISK_CACHE_PATH, "w", encoding="utf-8") as fh:
+            json.dump(serialized, fh)
+    except Exception as exc:
+        logger.debug("Greeting disk cache write skipped: %s", exc)
+
+
+_load_greeting_disk_cache()
 
 
 class VobizGeminiLiveSession(VobizCompoundSession):
@@ -69,6 +111,7 @@ class VobizGeminiLiveSession(VobizCompoundSession):
         self._user_turns = 0
         self._echo_guard_mono_until = 0.0
         self._playback_active_until_mono = 0.0
+        self._barge_in_passthrough_until = 0.0
         self._capturing_greeting_pcm = False
         self._captured_greeting_pcm = bytearray()
         self._captured_greeting_key = ""
@@ -267,6 +310,12 @@ class VobizGeminiLiveSession(VobizCompoundSession):
         if (now - self._ws_connected_at) < 1.5 and self._user_turns == 0:
             return
 
+        # Once caller barges in, stream their entire utterance uninterrupted for 3.5s
+        # so it is never chopped by repeated barge-in triggers.
+        if now < self._barge_in_passthrough_until:
+            await self._link.send_pcm16k(pcm_16k)
+            return
+
         phone_still_playing = (
             self.is_speaking
             or self._is_playing_welcome
@@ -298,6 +347,7 @@ class VobizGeminiLiveSession(VobizCompoundSession):
                         self.connection_id,
                         self._barge_in.speech_ms,
                     )
+                    self._barge_in_passthrough_until = now + 3.5
                     await self._on_interrupt(local_barge_in=True)
                     for chunk_16k in frames_to_send:
                         await self._link.send_pcm16k(chunk_16k)
@@ -430,8 +480,11 @@ class VobizGeminiLiveSession(VobizCompoundSession):
             self._last_user_transcript_at = time.monotonic()
             self._turn_first_audio_logged = False
             self._drop_model_audio_until_next_turn = False
+            self._barge_in_passthrough_until = 0.0
             if user_requested_hangup(text):
                 self._caller_wants_hangup = True
+        elif role == "assistant" and self._drop_model_audio_until_next_turn:
+            return
         cleaned = self._strip_call_end_marker(text) if role == "assistant" else text
         if role == "assistant":
             self._barge_in.on_assistant_transcript(cleaned)
@@ -456,8 +509,9 @@ class VobizGeminiLiveSession(VobizCompoundSession):
                 self._captured_greeting_key
                 and len(self._captured_greeting_pcm) >= 3200
             ):
-                _synthesized_greeting_pcm_cache[self._captured_greeting_key] = bytes(
-                    self._captured_greeting_pcm
+                save_synthesized_greeting_pcm(
+                    self._captured_greeting_key,
+                    bytes(self._captured_greeting_pcm),
                 )
             self._captured_greeting_pcm.clear()
         if self._out_residual and not self._drop_model_audio_until_next_turn:

@@ -248,6 +248,87 @@ async def borrow_gemini_socket():
     return None
 
 
+async def _warm_inbound_gemini_agents() -> None:
+    """Pre-fetch inbound agent bundles and pre-synthesize greeting PCM at startup."""
+    raw_nums = getattr(config, "PREWARM_INBOUND_NUMBERS", "") or ""
+    numbers = [n.strip() for n in raw_nums.split(",") if n.strip()]
+    if not numbers:
+        return
+    try:
+        from app import lovable_client
+        from app.telephony.vobiz.gemini_session import (
+            _synthesized_greeting_pcm_cache,
+            save_synthesized_greeting_pcm,
+        )
+        from app.voice_pipeline.gemini_live.link import GeminiLiveLink
+        from app.voice_pipeline.gemini_live.prewarm import (
+            build_gemini_instructions_for_agent,
+            build_welcome_text,
+        )
+
+        try:
+            import audioop
+        except ImportError:
+            audioop = None  # type: ignore[assignment]
+
+        for num in numbers:
+            try:
+                agent_cfg = await lovable_client.resolve_agent_bundle(number=num)
+            except Exception as exc:
+                logger.debug("Startup inbound bundle warm skipped for ...%s: %s", num[-4:], exc)
+                continue
+
+            welcome = build_welcome_text(agent_cfg)
+            if (
+                not welcome
+                or agent_cfg.greeting_audio_pcm
+                or welcome in _synthesized_greeting_pcm_cache
+                or audioop is None
+            ):
+                continue
+
+            # Pre-synthesize the greeting once using Gemini Live so the first call has 0ms TTS delay
+            pcm_buf = bytearray()
+            state = [None]
+            done_ev = asyncio.Event()
+
+            async def _on_audio(pcm_24k: bytes) -> None:
+                if pcm_24k:
+                    pcm_8k, state[0] = audioop.ratecv(
+                        pcm_24k, 2, 1, 24000, 8000, state[0]
+                    )
+                    pcm_buf.extend(pcm_8k)
+
+            async def _on_done() -> None:
+                done_ev.set()
+
+            link = GeminiLiveLink(
+                "startup_greeting_warm",
+                on_audio=_on_audio,
+                on_turn_complete=_on_done,
+            )
+            try:
+                await link.connect(build_gemini_instructions_for_agent(agent_cfg))
+                await link.say(
+                    "The phone call just connected. Speak ONLY this opening greeting "
+                    f"and do NOT call any tools: {welcome}"
+                )
+                await asyncio.wait_for(done_ev.wait(), timeout=6.0)
+                if len(pcm_buf) >= 3200:
+                    save_synthesized_greeting_pcm(welcome, bytes(pcm_buf))
+                    logger.info(
+                        "🎵 Startup pre-synthesized Gemini greeting agent_id=%s bytes=%s",
+                        agent_cfg.agent_id,
+                        len(pcm_buf),
+                    )
+            except Exception as exc:
+                logger.debug("Startup greeting synth skipped: %s", exc)
+            finally:
+                await link.close()
+    except Exception as exc:
+        logger.debug("Inbound Gemini prewarm skipped: %s", exc)
+
+
 async def _maintain_loop() -> None:
     interval = max(60, config.VOBIZ_WARM_POOL_REFRESH_SEC)
     while True:
@@ -255,6 +336,7 @@ async def _maintain_loop() -> None:
         await _prime_supabase()
         if config.VOICE_PIPELINE == "gemini_live":
             await _fill_gemini_pool()
+            asyncio.create_task(_warm_inbound_gemini_agents())
         else:
             await _fill_tts_pool()
             await _fill_stt_pool()
@@ -282,6 +364,7 @@ async def warm_on_process_start() -> None:
         except Exception:
             pass
         gemini_slots = await _fill_gemini_pool()
+        asyncio.create_task(_warm_inbound_gemini_agents())
         logger.info(
             "🔥 Gemini transport pool ready supabase=%s gemini_ws_slots=%s",
             supabase_ok,

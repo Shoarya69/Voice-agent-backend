@@ -55,6 +55,7 @@ WEBHOOK_PORT = _get_int("WEBHOOK_PORT", 8081)
 # When true, Exotel status callbacks (ringing/in-progress) prewarm agent data
 # for the dialed Exophone so the WSS handler finds a warm cache on `start`.
 PREWARM_ON_EXOTEL_STATUS = _get_bool("PREWARM_ON_EXOTEL_STATUS", True)
+PREWARM_INBOUND_NUMBERS = os.getenv("PREWARM_INBOUND_NUMBERS", "917965480875").strip()
 PREWARM_TTL_SECONDS = _get_int("PREWARM_TTL_SECONDS", 180)
 PREWARM_MAX_SESSIONS = _get_int("PREWARM_MAX_SESSIONS", 100)
 

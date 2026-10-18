@@ -5,19 +5,21 @@ from __future__ import annotations
 import re
 
 _USER_END_RE = re.compile(
-    r"(?i)\b("
+    r"(?i)(\b("
     r"bye|goodbye|good bye|disconnect|hang up|hangup|"
     r"call cut|call end|end call|end the call|"
-    r"band karo|call band|phone rakh|rakho|"
-    r"cut kar do|call kat|bas itna|that's all|thank you bye"
-    r")\b"
+    r"band karo|call band|phone rakh|rakho|rakh dijiye|rakh do|"
+    r"cut kar do|call kat|bas itna|that's all|thank you bye|nahi chahiye.*rakh"
+    r")\b|"
+    r"रख दीजिए|रख दो|फोन रख|कॉल कट|कॉल बंद|बंद कर दो|बंद करो|बस इतना ही|अलविदा)"
 )
 
 _CLOSING_RE = re.compile(
-    r"(?i)\b("
+    r"(?i)(\b("
     r"bye|goodbye|alvida|dhanyavad|dhanyavaad|shukriya|thank you|"
-    r"namaste|aapka din shubh|call rakh|phone rakh"
-    r")\b"
+    r"namaste|aapka din shubh|call rakh|phone rakh|have a great day"
+    r")\b|"
+    r"शुक्रिया|धन्यवाद|अलविदा|नमस्ते|आपका दिन शुभ)"
 )
 
 
