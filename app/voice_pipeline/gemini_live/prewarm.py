@@ -21,7 +21,7 @@ except ImportError:  # Python 3.13+
     audioop = None  # type: ignore[assignment]
 
 from app import config, lovable_client
-from app.audio_utils import pcm_bytes_to_ulaw, scale_pcm_volume
+from app.audio_utils import chunk_pcm, pcm_bytes_to_ulaw, scale_pcm_volume
 from app.supabase_agent_provider import normalize_language
 from app.voice_pipeline.gemini_live.link import GeminiLiveLink
 from app.voice_pipeline.tools import gemini_live_system_instructions
@@ -210,6 +210,18 @@ async def _warm_prepared_session(
         entry.welcome_text = build_welcome_text(entry.agent_config)
         instructions = build_gemini_instructions_for_agent(entry.agent_config)
 
+        cached_pcm = entry.agent_config.greeting_audio_pcm
+        if cached_pcm:
+            entry.pcm_8k_frames = chunk_pcm(cached_pcm)
+            entry.ulaw_greeting.extend(
+                pcm_bytes_to_ulaw(scale_pcm_volume(cached_pcm, config.TTS_VOLUME))
+            )
+            entry.greeting_started = True
+            entry.greeting_done = True
+            entry.greeting_first_byte_ms = round((time.monotonic() - started) * 1000, 1)
+            entry.greeting_total_ms = entry.greeting_first_byte_ms
+            entry.first_audio_event.set()
+
         async def _on_audio(pcm_24k: bytes) -> None:
             if entry.closed or entry.claimed or not pcm_24k:
                 return
@@ -272,7 +284,9 @@ async def _warm_prepared_session(
         if entry.closed or entry.claimed:
             return
 
-        if entry.welcome_text.strip():
+        if cached_pcm:
+            await link.inject_assistant_greeting_context(entry.welcome_text)
+        elif entry.welcome_text.strip():
             entry.greeting_started = True
             await link.say(
                 "The phone call just connected. Speak ONLY this opening greeting "

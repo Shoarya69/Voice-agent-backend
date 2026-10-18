@@ -39,7 +39,10 @@ and is not called from this service.
 import asyncio
 import base64
 import binascii
+import hashlib
+import json
 import logging
+import os
 import re
 import time
 from dataclasses import dataclass
@@ -93,6 +96,17 @@ _number_cache_lock = asyncio.Lock()
 _agent_with_greeting_cache: dict[str, tuple[float, "AgentConfig"]] = {}
 _greeting_cache_lock = asyncio.Lock()
 
+# greeting_audio_hash -> validated 8 kHz 16-bit mono PCM bytes (reused across calls)
+_greeting_pcm_by_hash: dict[str, bytes] = {}
+# voicebot_token -> greeting_audio_hash
+_token_greeting_hash: dict[str, str] = {}
+
+# Durable spool for failed call logs when portal is temporarily unreachable
+_FAILED_CALL_LOGS_PATH = os.path.join("logs", "failed_call_logs.jsonl")
+_call_log_spool_lock = asyncio.Lock()
+_CALL_LOG_MAX_RETRIES = 3
+_CALL_LOG_ATTEMPT_TIMEOUT = 10.0
+
 # In-flight bundle resolutions (prewarm + WSS prefetch share one MoontechPro fetch).
 _inflight_bundles: dict[str, asyncio.Task] = {}
 _inflight_lock = asyncio.Lock()
@@ -116,6 +130,7 @@ class AgentConfig:
     speed: float = 1.0
     tone: str = ""
     greeting_audio_pcm: bytes | None = None
+    greeting_audio_hash: str = ""
     channel_reservation_id: str = ""
     phone_number_id: str = ""
 
@@ -164,13 +179,21 @@ def _number_cache_keys(number: str) -> list[str]:
 
 def _normalize_greeting_pcm(pcm: bytes | None, *, agent_id: str = "") -> bytes | None:
     """
-    Accept greeting PCM only if it fits telephony limits.
-
-    Moontech cold-cache sometimes returns 15–20s clips (~300KB+ @ 8kHz).
-    Those block STT (inbound audio is ignored while the bot speaks) and
-    sound like the agent is frozen / stuttering on a live call.
+    Accept greeting PCM only if it is valid 8 kHz 16-bit mono PCM and fits limits.
+    Strips WAV RIFF header if present and aligns to 2-byte sample boundaries.
     """
     if not pcm:
+        return None
+    if len(pcm) > 44 and pcm[:4] == b"RIFF" and pcm[8:12] == b"WAVE":
+        # Strip standard WAV header up to the 'data' chunk
+        data_idx = pcm.find(b"data")
+        if 12 <= data_idx <= 128 and data_idx + 8 <= len(pcm):
+            pcm = pcm[data_idx + 8 :]
+        else:
+            pcm = pcm[44:]
+    if len(pcm) % 2 != 0:
+        pcm = pcm[:-1]
+    if len(pcm) < 320:
         return None
     duration_ms = pcm_duration_ms(pcm)
     max_ms = config.MAX_GREETING_AUDIO_MS
@@ -187,27 +210,91 @@ def _normalize_greeting_pcm(pcm: bytes | None, *, agent_id: str = "") -> bytes |
     return pcm
 
 
-def _decode_greeting_pcm(greeting: dict, *, agent_id: str = "") -> bytes | None:
-    """Decode pre-generated greeting audio (raw PCM 8kHz/16-bit/mono) from base64."""
-    audio_b64 = (greeting or {}).get("audio_base64") or ""
+def _decode_greeting_pcm(
+    greeting: dict,
+    *,
+    agent_id: str = "",
+    token: str = "",
+) -> tuple[bytes | None, str]:
+    """
+    Decode pre-generated greeting audio (raw PCM 8kHz/16-bit/mono) from base64
+    and cache by hash so subsequent calls reuse the decoded PCM bytes.
+    """
+    if not isinstance(greeting, dict):
+        return None, ""
+
+    audio_hash = str(
+        greeting.get("hash") or greeting.get("greeting_audio_hash") or ""
+    ).strip()
+    if audio_hash and audio_hash in _greeting_pcm_by_hash:
+        if token:
+            _token_greeting_hash[token] = audio_hash
+        return _greeting_pcm_by_hash[audio_hash], audio_hash
+
+    audio_b64 = (
+        greeting.get("audio_base64")
+        or greeting.get("greeting_audio_base64")
+        or ""
+    )
     if not audio_b64.strip():
-        return None
+        return None, audio_hash
     try:
-        pcm = base64.b64decode(audio_b64, validate=True)
+        raw_pcm = base64.b64decode(audio_b64, validate=True)
     except (ValueError, binascii.Error):
-        logger.warning("Invalid greeting.audio_base64 payload for agent greeting")
+        try:
+            raw_pcm = base64.b64decode(audio_b64)
+        except Exception:
+            logger.warning("Invalid greeting.audio_base64 payload for agent greeting")
+            return None, audio_hash
+
+    pcm = _normalize_greeting_pcm(raw_pcm, agent_id=agent_id)
+    if pcm is not None:
+        if not audio_hash:
+            audio_hash = hashlib.sha256(pcm).hexdigest()[:24]
+        _greeting_pcm_by_hash[audio_hash] = pcm
+        if token:
+            _token_greeting_hash[token] = audio_hash
+    return pcm, audio_hash
+
+
+async def get_agent_greeting_pcm(voicebot_token: str) -> bytes | None:
+    """
+    Retrieve cached or portal-provided 8 kHz PCM greeting for ``voicebot_token``,
+    keyed by greeting hash so it is never re-decoded or re-synthesized per call.
+    """
+    tok = (voicebot_token or "").strip()
+    if not tok:
         return None
-    return _normalize_greeting_pcm(pcm, agent_id=agent_id)
+
+    known_hash = _token_greeting_hash.get(tok)
+    if known_hash and known_hash in _greeting_pcm_by_hash:
+        return _greeting_pcm_by_hash[known_hash]
+
+    cached_cfg = _agent_cache.get(tok)
+    if cached_cfg is not None and cached_cfg[1].greeting_audio_pcm:
+        return cached_cfg[1].greeting_audio_pcm
+
+    greeting_obj = await supabase_agent_provider.fetch_agent_greeting_pcm(tok)
+    if greeting_obj:
+        pcm, _ = _decode_greeting_pcm(greeting_obj, token=tok)
+        if pcm is not None:
+            return pcm
+    return None
 
 
 def _parse_agent_config_payload(payload: dict, token: str = "") -> AgentConfig:
     greeting = payload.get("greeting") or {}
-    greeting_pcm = _decode_greeting_pcm(greeting, agent_id=payload.get("agent_id", ""))
+    resolved_token = payload.get("token") or payload.get("voicebot_token") or token
+    greeting_pcm, greeting_hash = _decode_greeting_pcm(
+        greeting,
+        agent_id=payload.get("agent_id", ""),
+        token=resolved_token,
+    )
     first_message = payload.get("first_message") or greeting.get("text") or ""
 
     return AgentConfig(
         agent_id=payload["agent_id"],
-        token=payload.get("token") or token,
+        token=resolved_token,
         user_id=payload.get("user_id", ""),
         system_prompt=payload.get("system_prompt") or "",
         voice_id=payload.get("voice_id") or "",
@@ -218,6 +305,7 @@ def _parse_agent_config_payload(payload: dict, token: str = "") -> AgentConfig:
         speed=float(payload.get("speed", 1.0)),
         tone=payload.get("tone") or "",
         greeting_audio_pcm=greeting_pcm,
+        greeting_audio_hash=greeting_hash,
         channel_reservation_id=(
             payload.get("channel_reservation_id")
             or payload.get("channel_id")
@@ -435,10 +523,18 @@ async def _resolve_agent_bundle_impl(
     else:
         raise LovableClientError("missing token or number")
 
+    if not base.greeting_audio_pcm and base.token:
+        pcm = await get_agent_greeting_pcm(base.token)
+        if pcm is not None:
+            base.greeting_audio_pcm = pcm
+            base.greeting_audio_hash = _token_greeting_hash.get(base.token, "")
+
     if base.greeting_audio_pcm:
         logger.info(
-            "LATENCY bundle agent_id=%s greeting=embedded ms=%.0f",
+            "LATENCY bundle agent_id=%s greeting=cached_pcm hash=%s bytes=%s ms=%.0f",
             base.agent_id,
+            base.greeting_audio_hash[:12] if base.greeting_audio_hash else "embedded",
+            len(base.greeting_audio_pcm),
             (time.perf_counter() - started) * 1000,
         )
         return base
@@ -582,53 +678,103 @@ async def _fetch_agent_by_number_from_lovable(number: str) -> AgentConfig:
         raise LovableClientError(f"malformed agent config payload: {exc}") from exc
 
 
-async def post_call_log(payload: dict) -> None:
+async def _spool_failed_call_log(payload: dict) -> None:
+    def _write_line(path: str, text: str) -> None:
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(text)
+
+    try:
+        os.makedirs(os.path.dirname(_FAILED_CALL_LOGS_PATH), exist_ok=True)
+        line = json.dumps(payload, ensure_ascii=False) + "\n"
+        async with _call_log_spool_lock:
+            await asyncio.to_thread(_write_line, _FAILED_CALL_LOGS_PATH, line)
+        logger.warning(
+            "Call-log spooled to disk for durable retry call_sid=%s path=%s",
+            payload.get("provider_call_sid") or payload.get("call_sid"),
+            _FAILED_CALL_LOGS_PATH,
+        )
+    except Exception as exc:
+        logger.error("Failed to spool call-log to disk: %s", exc)
+
+
+async def post_call_log(payload: dict) -> bool:
     """
-    Fire-and-forget: POST a call summary/transcript to Lovable at
-    /api/public/voicebot/call-log. Callers should schedule this with
-    `asyncio.create_task(...)` rather than awaiting it inline, so a
-    slow/unreachable Lovable never delays closing the WebSocket.
-    This function never raises.
+    POST a call summary/transcript to Lovable at /api/public/voicebot/call-log
+    with up to 3 retries and exponential backoff (1s, 2s, 4s).
+    Preserves failed payloads in a durable disk spool if all retries fail.
+    Never raises.
     """
+    call_sid = payload.get("provider_call_sid") or payload.get("call_sid") or ""
     if not config.LOVABLE_APP_URL:
-        logger.warning("Skipping call-log post: LOVABLE_APP_URL is not configured")
-        return
+        logger.warning(
+            "Skipping call-log post call_sid=%s: LOVABLE_APP_URL is not configured",
+            call_sid,
+        )
+        return False
 
     url = f"{config.LOVABLE_APP_URL.rstrip('/')}{_CALL_LOG_PATH}"
     headers = {"Content-Type": "application/json"}
     if config.LOVABLE_API_SECRET:
         headers["Authorization"] = f"Bearer {config.LOVABLE_API_SECRET}"
 
-    try:
-        client = await _get_client()
-        response = await client.post(
-            url,
-            json=payload,
-            headers=headers,
-            timeout=_CALL_LOG_TIMEOUT,
-        )
-        if response.status_code >= 400:
-            logger.error(
-                "Lovable call-log post failed call_sid=%s status=%s body=%s",
-                payload.get("call_sid"),
+    last_reason = "unknown"
+    for attempt in range(1, _CALL_LOG_MAX_RETRIES + 1):
+        try:
+            client = await _get_client()
+            response = await client.post(
+                url,
+                json=payload,
+                headers=headers,
+                timeout=_CALL_LOG_ATTEMPT_TIMEOUT,
+            )
+            if response.status_code < 400:
+                logger.info(
+                    "Lovable call-log posted call_sid=%s provider_call_sid=%s "
+                    "agent_id=%s status=%s attempt=%s/%s",
+                    payload.get("call_sid"),
+                    payload.get("provider_call_sid"),
+                    payload.get("agent_id"),
+                    response.status_code,
+                    attempt,
+                    _CALL_LOG_MAX_RETRIES,
+                )
+                return True
+
+            last_reason = f"HTTP {response.status_code}: {response.text[:160]}"
+            logger.warning(
+                "Lovable call-log attempt %s/%s failed call_sid=%s status=%s reason=%s",
+                attempt,
+                _CALL_LOG_MAX_RETRIES,
+                call_sid,
                 response.status_code,
-                response.text[:200],
+                response.text[:160],
             )
-        else:
-            logger.info(
-                "Lovable call-log posted call_sid=%s agent_id=%s",
-                payload.get("call_sid"),
-                payload.get("agent_id"),
+            # Do not retry permanent 4xx client errors except 408/429
+            if 400 <= response.status_code < 500 and response.status_code not in (408, 429):
+                break
+        except Exception as exc:  # noqa: BLE001
+            detail = str(exc) or repr(getattr(exc, "__cause__", None)) or repr(exc)
+            last_reason = f"{type(exc).__name__}: {detail}"
+            logger.warning(
+                "Lovable call-log attempt %s/%s error call_sid=%s reason=%s",
+                attempt,
+                _CALL_LOG_MAX_RETRIES,
+                call_sid,
+                last_reason,
             )
-    except Exception as exc:  # noqa: BLE001 - a Lovable outage must never crash the voicebot
-        detail = str(exc) or repr(getattr(exc, "__cause__", None)) or repr(exc)
-        logger.error(
-            "Lovable call-log post error call_sid=%s url=%s error_type=%s error=%s",
-            payload.get("call_sid"),
-            url,
-            type(exc).__name__,
-            detail,
-        )
+
+        if attempt < _CALL_LOG_MAX_RETRIES:
+            backoff_s = float(2 ** (attempt - 1))
+            await asyncio.sleep(backoff_s)
+
+    logger.error(
+        "Lovable call-log delivery failed after %s attempts call_sid=%s final_reason=%s",
+        _CALL_LOG_MAX_RETRIES,
+        call_sid,
+        last_reason,
+    )
+    await _spool_failed_call_log(payload)
+    return False
 
 
 async def _post_exotel_webhook(path: str, number: str, fields: dict) -> None:

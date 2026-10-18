@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
+import time
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 
@@ -25,6 +27,58 @@ from app.telephony.vobiz.session import VobizCompoundSession
 from app.telephony.vobiz.stream import VobizStream
 
 logger = logging.getLogger(__name__)
+
+# Active Vobiz sessions keyed by normalized 10-digit phone number so a new
+# inbound call on a single-channel number safely evicts any stuck prior session.
+_active_vobiz_by_number: dict[str, VobizCompoundSession] = {}
+_active_number_lock = asyncio.Lock()
+
+
+def _normalize_number_key(number: str | None) -> str:
+    digits = re.sub(r"\D", "", str(number or ""))
+    if len(digits) >= 10:
+        return digits[-10:]
+    return digits
+
+
+async def _register_session_for_number(
+    number: str | None,
+    session: VobizCompoundSession,
+) -> None:
+    key = _normalize_number_key(number)
+    if not key:
+        return
+    stale: VobizCompoundSession | None = None
+    async with _active_number_lock:
+        existing = _active_vobiz_by_number.get(key)
+        if existing is not None and existing is not session and not existing._closed:
+            stale = existing
+        _active_vobiz_by_number[key] = session
+
+    if stale is not None:
+        logger.warning(
+            "♻️ Evicting stale Vobiz session=%s for number=...%s (replaced by session=%s)",
+            stale.connection_id,
+            key[-4:],
+            session.connection_id,
+        )
+        try:
+            await stale.close()
+            await stale.websocket.close(code=1000, reason="replaced by new call")
+        except Exception:
+            pass
+
+
+async def _unregister_session_for_number(
+    number: str | None,
+    session: VobizCompoundSession,
+) -> None:
+    key = _normalize_number_key(number)
+    if not key:
+        return
+    async with _active_number_lock:
+        if _active_vobiz_by_number.get(key) is session:
+            _active_vobiz_by_number.pop(key, None)
 
 
 def is_vobiz_websocket_path(path: str | None) -> bool:
@@ -50,11 +104,39 @@ async def handle_vobiz_websocket(websocket) -> None:
     # Import here to avoid circular import with ai_server at module load time.
     import ai_server as voice_server
 
+    t0 = time.monotonic()
     connection_id = f"vobiz_{int(datetime.now(timezone.utc).timestamp() * 1000)}"
     end_reason = "websocket_close"
     session: VobizCompoundSession | None = None
+    early_warm_task: asyncio.Task | None = None
+    registered_number: str | None = None
+
+    # Evict stale session on the same dialed number BEFORE checking capacity
+    wss_kind, wss_val, request_path = voice_server._extract_wss_route(websocket)
+    if wss_kind == "number" and wss_val:
+        key = _normalize_number_key(wss_val)
+        async with _active_number_lock:
+            stale_before_cap = _active_vobiz_by_number.pop(key, None) if key else None
+        if stale_before_cap is not None and not stale_before_cap._closed:
+            logger.warning(
+                "♻️ Force-closing stale Vobiz session=%s on number=...%s before capacity check",
+                stale_before_cap.connection_id,
+                key[-4:],
+            )
+            try:
+                await stale_before_cap.close()
+                await stale_before_cap.websocket.close(
+                    code=1000, reason="stale session replaced"
+                )
+            except Exception:
+                pass
 
     if not await try_acquire_session():
+        logger.warning(
+            "WS_REJECT session_id=%s path=%r reason=server_at_capacity",
+            connection_id,
+            request_path,
+        )
         try:
             await websocket.close(code=1013, reason="server at capacity")
         except Exception:
@@ -63,9 +145,11 @@ async def handle_vobiz_websocket(websocket) -> None:
 
     try:
         active = await increment_active_sessions()
+        accept_ms = round((time.monotonic() - t0) * 1000, 1)
         logger.info(
-            "🔗 Vobiz WebSocket connected: %s (active=%s/%s)",
+            "🔗 Vobiz WebSocket accepted: session_id=%s accept_ms=%.1f (active=%s/%s)",
             connection_id,
+            accept_ms,
             active,
             config.MAX_CONCURRENT_SESSIONS,
         )
@@ -73,16 +157,19 @@ async def handle_vobiz_websocket(websocket) -> None:
         vobiz = VobizStream(websocket)
         if config.VOICE_PIPELINE == "gemini_live":
             session = VobizGeminiLiveSession(connection_id, websocket, vobiz)
+            session.accept_ms = accept_ms
         else:
             session = VobizCompoundSession(connection_id, websocket, vobiz)
         session.telephony_provider = "vobiz"
-        session.wss_route_kind, session.wss_route_value, request_path = (
-            voice_server._extract_wss_route(websocket)
-        )
+        session.wss_route_kind, session.wss_route_value = wss_kind, wss_val
         ws_call_id = voice_server._extract_call_id(websocket)
         session.lovable_token = (
             session.wss_route_value if session.wss_route_kind == "token" else None
         )
+        if session.wss_route_kind == "number" and session.wss_route_value:
+            registered_number = session.wss_route_value
+            await _register_session_for_number(registered_number, session)
+
         logger.info(
             "🔎 Vobiz WS path=%r route=%s",
             request_path,
@@ -101,40 +188,41 @@ async def handle_vobiz_websocket(websocket) -> None:
         voice_server._assume_channel_reserved(session)
         voice_server._log_channel_reserved(session, connection_id)
 
-        agent_preloaded = False
-        if isinstance(session, VobizGeminiLiveSession) and (
-            ws_call_id or session.lovable_token
-        ):
-            from app.voice_pipeline.gemini_live.prewarm import (
-                claim_prepared_gemini_session,
-            )
+        # Start all session / agent / Gemini initialization asynchronously AFTER accepting
+        # the WebSocket so reading `start` from Vobiz is NEVER blocked.
+        async def _async_init_session() -> bool:
+            if isinstance(session, VobizGeminiLiveSession) and (
+                ws_call_id or session.lovable_token
+            ):
+                from app.voice_pipeline.gemini_live.prewarm import (
+                    claim_prepared_gemini_session,
+                )
 
-            prepared = await claim_prepared_gemini_session(
-                call_id=ws_call_id,
-                token=session.lovable_token,
-            )
-            if prepared is not None:
-                agent_preloaded = await session.attach_prepared_session(prepared)
-                if agent_preloaded:
-                    voice_server._commit_agent_config_to_session(session)
+                prepared = await claim_prepared_gemini_session(
+                    call_id=ws_call_id,
+                    token=session.lovable_token,
+                )
+                if prepared is not None:
+                    attached = await session.attach_prepared_session(prepared)
+                    if attached:
+                        voice_server._commit_agent_config_to_session(session)
+                        return True
 
-        if not agent_preloaded:
             start_agent_prefetch(session, connection_id)
             preconnect = getattr(session, "preconnect_socket", None)
             if preconnect is not None:
                 asyncio.create_task(preconnect())
 
-            # Load agent before `start` so Vobiz hears playAudio within ~1–2s (not after 6s HTTP).
             if session.wss_route_kind in ("token", "number") and session.wss_route_value:
                 logger.info(
-                    "⏳ Vobiz early agent prefetch conn=%s route=%s",
+                    "⏳ Vobiz async agent prefetch conn=%s route=%s",
                     connection_id,
                     session.wss_route_kind,
                 )
-                agent_preloaded = await voice_server._await_agent_prefetch(
+                loaded = await voice_server._await_agent_prefetch(
                     session, connection_id
                 )
-                if agent_preloaded:
+                if loaded:
                     voice_server._commit_agent_config_to_session(session)
                     await session.warm_playback_pipeline()
                     if (
@@ -142,7 +230,11 @@ async def handle_vobiz_websocket(websocket) -> None:
                         and session._streaming.enabled
                     ):
                         asyncio.create_task(session._streaming.ensure_stt_if_needed())
+                    return True
+            return False
 
+        early_warm_task = asyncio.create_task(_async_init_session())
+        agent_preloaded = False
         agent_started = False
 
         async for message in websocket:
@@ -163,6 +255,9 @@ async def handle_vobiz_websocket(websocket) -> None:
                 session.call_sid = extract_call_sid(data, start_data)
                 session.call_started_at = datetime.now(timezone.utc)
                 session.caller_from, session.caller_to = extract_parties(data, start_data)
+                if not registered_number and session.caller_to:
+                    registered_number = session.caller_to
+                    await _register_session_for_number(registered_number, session)
                 call_records.apply_start_metadata(session, start_data)
                 logger.info(
                     "🚀 Vobiz START %s call_sid=%s stream=%s from=%s to=%s "
@@ -183,6 +278,18 @@ async def handle_vobiz_websocket(websocket) -> None:
                         connection_id,
                     )
                 voice_server._log_call_started(session, connection_id)
+
+                if early_warm_task is not None:
+                    try:
+                        agent_preloaded = await early_warm_task
+                    except Exception as exc:
+                        logger.warning(
+                            "Early warm task failed conn=%s: %s",
+                            connection_id,
+                            exc,
+                        )
+                        agent_preloaded = False
+                    early_warm_task = None
 
                 if not agent_preloaded and isinstance(session, VobizGeminiLiveSession):
                     from app.voice_pipeline.gemini_live.prewarm import (
@@ -253,7 +360,12 @@ async def handle_vobiz_websocket(websocket) -> None:
         end_reason = "exception"
         logger.exception("❌ Vobiz connection error for %s: %s", connection_id, exc)
     finally:
+        if early_warm_task is not None and not early_warm_task.done():
+            early_warm_task.cancel()
         if session is not None:
+            await _unregister_session_for_number(
+                registered_number or session.caller_to, session
+            )
             if config.VOICE_PIPELINE == "gemini_live":
                 from app.voice_pipeline.gemini_live.prewarm import (
                     remove_prepared_gemini_session,
@@ -263,6 +375,18 @@ async def handle_vobiz_websocket(websocket) -> None:
                     call_id=ws_call_id or session.call_sid,
                     token=session.lovable_token,
                 )
+            logger.info(
+                "CALL_METRICS event=disconnect session_id=%s provider_call_sid=%s "
+                "caller=%s accept_ms=%s session_ready_ms=%s first_audio_out_ms=%s "
+                "disconnect_reason=%s",
+                connection_id,
+                session.call_sid or "unknown",
+                (session.caller_from or "")[-4:] if session.caller_from else "unknown",
+                getattr(session, "accept_ms", 0.0),
+                getattr(session, "session_ready_ms", None),
+                getattr(session, "first_audio_out_ms", None),
+                end_reason,
+            )
             await voice_server._finalize_call_session(session, connection_id, end_reason)
             await session.close()
         remaining = await decrement_active_sessions()

@@ -12,8 +12,12 @@ import logging
 import time
 from dataclasses import dataclass
 
-import webrtcvad
 import websockets.exceptions
+
+try:
+    import webrtcvad
+except ImportError:
+    webrtcvad = None  # type: ignore[assignment]
 
 from app import config
 from app.audio_utils import (
@@ -61,7 +65,7 @@ def _update_noise_floor_state(
 
 
 def _compute_vad_decisions(
-    vad: webrtcvad.Vad,
+    vad,
     frames: list[bytes],
     noise_floor_rms: float,
     max_rms_seen: float,
@@ -77,7 +81,11 @@ def _compute_vad_decisions(
         rms = pcm_rms(frame)
         max_rms = max(max_rms, rms)
         try:
-            vad_is_speech = vad.is_speech(frame, config.SAMPLE_RATE)
+            vad_is_speech = (
+                vad.is_speech(frame, config.SAMPLE_RATE)
+                if vad is not None
+                else rms >= config.DYNAMIC_RMS_MIN
+            )
         except Exception:
             vad_is_speech = False
 
@@ -117,7 +125,7 @@ class VoiceSession(VoicePipelineSession):
     def __init__(self, connection_id: str, websocket):
         super().__init__(connection_id, websocket)
 
-        self._vad = webrtcvad.Vad(config.VAD_MODE)
+        self._vad = webrtcvad.Vad(config.VAD_MODE) if webrtcvad is not None else None
         self._residual_pcm = bytearray()
         self._audio_buffer = bytearray()
         self._turn_monitor_task: asyncio.Task | None = None

@@ -32,6 +32,7 @@ AGENT_COLS = (
 
 _INBOUND_AGENT_RPC = "get_inbound_agent_bundle"
 _TOKEN_AGENT_RPC = "get_agent_bundle_by_token"
+_GREETING_PCM_RPC = "get_agent_greeting_pcm"
 
 _DEFAULT_VOICE_ID = "cgSgspJ2msm6clMCkdW9"
 _DEFAULT_SYSTEM_PROMPT = "You are a helpful voice assistant."
@@ -410,6 +411,65 @@ async def fetch_agent_payload_by_token(token: str) -> dict[str, Any]:
         row.get("agent_id"),
     )
     return _payload_from_inbound_rpc_row(row)
+
+
+async def fetch_agent_greeting_pcm(voicebot_token: str) -> dict[str, Any] | None:
+    """
+    Fetch pre-generated 8 kHz PCM greeting (hash + base64) via Supabase RPC
+    ``get_agent_greeting_pcm(voicebot_token)``. Returns dict with ``hash``,
+    ``audio_base64``, ``mime``, ``text`` or None if unavailable.
+    """
+    raw = (voicebot_token or "").strip()
+    if not raw or not is_configured():
+        return None
+
+    client = await _get_supabase()
+
+    for param_key in ("voicebot_token", "_token", "p_token", "token"):
+        try:
+            result = await _run_sync(
+                lambda k=param_key: client.rpc(_GREETING_PCM_RPC, {k: raw}).execute()
+            )
+            data = getattr(result, "data", None)
+            row: dict[str, Any] | None = None
+            if isinstance(data, list):
+                row = data[0] if data else None
+            elif isinstance(data, dict):
+                row = data
+            if row and (
+                row.get("audio_base64")
+                or row.get("greeting_audio_base64")
+                or row.get("pcm_base64")
+            ):
+                return {
+                    "hash": (
+                        row.get("hash")
+                        or row.get("greeting_audio_hash")
+                        or row.get("audio_hash")
+                        or ""
+                    ),
+                    "audio_base64": (
+                        row.get("audio_base64")
+                        or row.get("greeting_audio_base64")
+                        or row.get("pcm_base64")
+                    ),
+                    "mime": (
+                        row.get("mime")
+                        or row.get("greeting_audio_mime")
+                        or "audio/L16;rate=8000"
+                    ),
+                    "text": (
+                        row.get("text")
+                        or row.get("first_message")
+                        or row.get("greeting_message")
+                        or ""
+                    ),
+                }
+            if row is not None:
+                break
+        except Exception:
+            continue
+    return None
 
 
 async def fetch_greeting_from_moontech(agent_id: str) -> dict[str, Any] | None:

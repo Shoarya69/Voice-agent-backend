@@ -144,7 +144,13 @@ GEMINI_LIVE_WS_URL = os.getenv(
     "wss://generativelanguage.googleapis.com/ws/"
     "google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent",
 ).strip()
-GEMINI_LIVE_SILENCE_MS = _get_int("GEMINI_LIVE_SILENCE_MS", 400)
+# Endpointing silence duration: 700–900 ms (default 800 ms) so 200ms pauses do not cut in.
+GEMINI_LIVE_SILENCE_MS = _get_int("GEMINI_LIVE_SILENCE_MS", 800)
+GEMINI_LIVE_PREFIX_PADDING_MS = _get_int("GEMINI_LIVE_PREFIX_PADDING_MS", 300)
+GEMINI_BARGE_IN_ENABLED = _get_bool("GEMINI_BARGE_IN_ENABLED", True)
+GEMINI_BARGE_IN_MIN_SPEECH_MS = _get_int("GEMINI_BARGE_IN_MIN_SPEECH_MS", 320)
+GEMINI_BACKCHANNEL_MAX_MS = _get_int("GEMINI_BACKCHANNEL_MAX_MS", 800)
+GEMINI_BARGE_IN_RMS_THRESHOLD = _get_float("GEMINI_BARGE_IN_RMS_THRESHOLD", 550.0)
 
 # OpenAI Realtime (only when VOICE_PIPELINE=openai_realtime)
 OPENAI_REALTIME_MODEL = os.getenv("OPENAI_REALTIME_MODEL", "gpt-realtime-2.1")

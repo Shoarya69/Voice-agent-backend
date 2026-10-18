@@ -20,9 +20,10 @@ if TYPE_CHECKING:
     from app.voice_pipeline.gemini_live.prewarm import PreparedGeminiSession
 
 from app import config
-from app.audio_utils import decode_payload
+from app.audio_utils import chunk_pcm, decode_payload
 from app.openai_service import openai_brain
 from app.voice_pipeline.base import VoicePipelineSession
+from app.voice_pipeline.gemini_live.barge_in import GeminiBargeInController
 from app.voice_pipeline.gemini_live.call_end import (
     assistant_sounds_like_closing,
     user_requested_hangup,
@@ -54,6 +55,8 @@ class GeminiLivePipelineSession(VoicePipelineSession):
         self._caller_wants_hangup = False
         self._last_model_audio_at = 0.0
         self._user_turns = 0
+        self._drop_model_audio_until_next_turn = False
+        self._barge_in = GeminiBargeInController()
         self._link = GeminiLiveLink(
             connection_id,
             on_audio=self._on_model_audio,
@@ -122,6 +125,8 @@ class GeminiLivePipelineSession(VoicePipelineSession):
         )
 
     async def on_agent_ready(self) -> None:
+        if self.greeting_audio_pcm:
+            return
         await self._ensure_link()
 
     async def add_audio_chunk(self, media_data: dict) -> None:
@@ -131,27 +136,54 @@ class GeminiLivePipelineSession(VoicePipelineSession):
             if (time.monotonic() - self._last_model_audio_at) > 0.6:
                 self.is_speaking = False
                 self._is_playing_welcome = False
-        if (self.is_speaking or self._is_playing_welcome) and not config.ENABLE_BARGE_IN:
-            return
+                self._barge_in.on_assistant_turn_complete()
         pcm_8k = decode_payload(media_data.get("payload", ""))
         if not pcm_8k:
             return
         pcm_16k, self._in_state = audioop.ratecv(
             pcm_8k, 2, 1, 8000, 16000, self._in_state
         )
+        if self.is_speaking or self._is_playing_welcome:
+            should_interrupt, frames_to_send = (
+                self._barge_in.process_caller_frame_during_playback(pcm_8k, pcm_16k)
+            )
+            if should_interrupt:
+                await self._on_interrupt(local_barge_in=True)
+                for chunk_16k in frames_to_send:
+                    await self._link.send_pcm16k(chunk_16k)
+            return
+        self._drop_model_audio_until_next_turn = False
         await self._link.send_pcm16k(pcm_16k)
 
+    async def _connect_and_inject_greeting_context(self, welcome: str) -> None:
+        try:
+            await self._ensure_link()
+            await self._link.inject_assistant_greeting_context(welcome)
+        except Exception as exc:
+            logger.warning("Gemini Live background connect failed conn=%s: %s", self.connection_id, exc)
+
     async def speak_welcome(self) -> None:
+        welcome = (config.WELCOME_MESSAGE or "").strip()
+        if not self._greeting_started and self.greeting_audio_pcm:
+            self._greeting_started = True
+            self._prewarm_greeting_done = True
+            self._prewarm_pcm_frames = chunk_pcm(self.greeting_audio_pcm)
+            if welcome:
+                self.history.append({"role": "assistant", "content": welcome})
+                self._barge_in.on_assistant_transcript(welcome)
+            asyncio.create_task(self._connect_and_inject_greeting_context(welcome))
+
         if self._greeting_started:
             if self._prewarm_pcm_frames:
                 frames = list(self._prewarm_pcm_frames)
                 self._prewarm_pcm_frames.clear()
                 self._is_playing_welcome = True
                 self.is_speaking = True
+                self._barge_in.on_assistant_speaking_start()
                 self._last_model_audio_at = time.monotonic()
                 try:
                     for idx, frame in enumerate(frames):
-                        if not await self.send_pcm_frame(frame):
+                        if not self._is_playing_welcome or not await self.send_pcm_frame(frame):
                             break
                         if idx == 0:
                             self._log_prewarm_first_audio_if_needed()
@@ -160,16 +192,18 @@ class GeminiLivePipelineSession(VoicePipelineSession):
                     if self._prewarm_greeting_done:
                         self._is_playing_welcome = False
                         self.is_speaking = False
+                        self._barge_in.on_assistant_turn_complete()
             return
         if not config.ENABLE_WELCOME_MESSAGE:
             return
-        welcome = (config.WELCOME_MESSAGE or "").strip()
         if not welcome:
             return
         await self._ensure_link()
         self._greeting_started = True
         self._is_playing_welcome = True
         self.is_speaking = True
+        self._barge_in.on_assistant_transcript(welcome)
+        self._barge_in.on_assistant_speaking_start()
         self._last_model_audio_at = time.monotonic()
         await self._link.say(
             "The phone call just connected. Speak ONLY this opening greeting "
@@ -190,8 +224,10 @@ class GeminiLivePipelineSession(VoicePipelineSession):
         await self._link.connect(gemini_live_system_instructions(base))
 
     async def _on_model_audio(self, pcm_24k: bytes) -> None:
-        if self._closed or not pcm_24k:
+        if self._closed or not pcm_24k or self._drop_model_audio_until_next_turn:
             return
+        if not self.is_speaking:
+            self._barge_in.on_assistant_speaking_start()
         self.is_speaking = True
         self._last_model_audio_at = time.monotonic()
         pcm_8k, self._out_state = audioop.ratecv(
@@ -215,9 +251,12 @@ class GeminiLivePipelineSession(VoicePipelineSession):
     async def _on_transcript(self, role: str, text: str) -> None:
         if role == "user":
             self._user_turns += 1
+            self._drop_model_audio_until_next_turn = False
             if user_requested_hangup(text):
                 self._caller_wants_hangup = True
         cleaned = self._strip_call_end_marker(text) if role == "assistant" else text
+        if role == "assistant":
+            self._barge_in.on_assistant_transcript(cleaned)
         self._append_history_message(role, cleaned)
         logger.info("Gemini Live %s (%s): %s", role, self.connection_id, cleaned[:160])
         if role == "assistant" and self._caller_wants_hangup and assistant_sounds_like_closing(
@@ -233,11 +272,12 @@ class GeminiLivePipelineSession(VoicePipelineSession):
         await asyncio.sleep(0.35)
 
     async def _on_turn_complete(self) -> None:
-        if self._out_residual:
+        if self._out_residual and not self._drop_model_audio_until_next_turn:
             await self.send_pcm_frame(bytes(self._out_residual))
             self._out_residual.clear()
         self._is_playing_welcome = False
         self.is_speaking = False
+        self._barge_in.on_assistant_turn_complete()
         if (
             not self._should_end_call
             and self._caller_wants_hangup
@@ -247,7 +287,10 @@ class GeminiLivePipelineSession(VoicePipelineSession):
             self._should_end_call = True
         self._schedule_close_after_playback_if_needed()
 
-    async def _on_interrupt(self) -> None:
+    async def _on_interrupt(self, local_barge_in: bool = False) -> None:
+        if local_barge_in:
+            self._drop_model_audio_until_next_turn = True
+        self._barge_in.mark_interrupted()
         self._out_residual.clear()
         self._out_state = None
         self._is_playing_welcome = False

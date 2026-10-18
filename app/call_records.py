@@ -120,13 +120,21 @@ def build_call_log_payload(
 
     payload: dict[str, Any] = {
         "call_sid": call_sid,
+        "provider_call_sid": call_sid,
         "user_id": agent_config.user_id if agent_config else "",
         "agent_id": getattr(session, "agent_id", None)
         or (agent_config.agent_id if agent_config else ""),
         "phone_number_id": getattr(agent_config, "phone_number_id", "") if agent_config else "",
         "provider": getattr(session, "telephony_provider", None) or "exotel",
         "from_number": _log_phone(getattr(session, "caller_from", None)),
-        "to_number": _log_phone(getattr(session, "caller_to", None)),
+        "to_number": _log_phone(
+            getattr(session, "caller_to", None)
+            or (
+                session.wss_route_value
+                if getattr(session, "wss_route_kind", None) == "number"
+                else None
+            )
+        ),
         "direction": getattr(session, "call_direction", None) or "inbound",
         "duration_seconds": duration_seconds,
         "started_at": iso_z(started_at),
@@ -404,7 +412,10 @@ async def finalize_call(session: VoicePipelineSession) -> None:
     """Dual-write: Supabase ai_calls + Lovable call-log (never raises)."""
     if getattr(session, "_call_log_posted", False):
         return
-    if not (getattr(session, "agent_config", None) or getattr(session, "agent_id", None)):
+    has_agent = bool(
+        getattr(session, "agent_config", None) or getattr(session, "agent_id", None)
+    )
+    if not has_agent and not getattr(session, "call_sid", None):
         return
 
     session._call_log_posted = True
@@ -415,7 +426,8 @@ async def finalize_call(session: VoicePipelineSession) -> None:
     async with _enrichment_lock:
         _hangup_enrichment.pop(call_sid, None)
 
-    await persist_call_completed(payload)
+    if has_agent:
+        await persist_call_completed(payload)
     await lovable_client.post_call_log(payload)
     unregister_session(session)
 

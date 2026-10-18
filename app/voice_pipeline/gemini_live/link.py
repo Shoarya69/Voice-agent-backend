@@ -120,6 +120,7 @@ class GeminiLiveLink:
                     "realtimeInputConfig": {
                         "automaticActivityDetection": {
                             "silenceDurationMs": config.GEMINI_LIVE_SILENCE_MS,
+                            "prefixPaddingMs": config.GEMINI_LIVE_PREFIX_PADDING_MS,
                         }
                     },
                     "tools": build_gemini_live_tools(),
@@ -204,6 +205,24 @@ class GeminiLiveLink:
                         }
                     ],
                     "turnComplete": True,
+                }
+            }
+        )
+
+    async def inject_assistant_greeting_context(self, greeting_text: str) -> None:
+        """Record an already-played cached PCM greeting into Gemini Live context without speaking."""
+        if self._closed or not self.ready or not (greeting_text or "").strip():
+            return
+        await self._send(
+            {
+                "clientContent": {
+                    "turns": [
+                        {
+                            "role": "model",
+                            "parts": [{"text": greeting_text.strip()}],
+                        }
+                    ],
+                    "turnComplete": False,
                 }
             }
         )
