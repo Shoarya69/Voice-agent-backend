@@ -7,10 +7,17 @@ Exotel session for Gemini Live.
 from __future__ import annotations
 
 import asyncio
-import audioop
 import logging
 import time
-from typing import ClassVar
+from typing import TYPE_CHECKING, ClassVar
+
+try:
+    import audioop
+except ImportError:  # Python 3.13+
+    audioop = None  # type: ignore[assignment]
+
+if TYPE_CHECKING:
+    from app.voice_pipeline.gemini_live.prewarm import PreparedGeminiSession
 
 from app import config
 from app.audio_utils import decode_payload
@@ -38,6 +45,12 @@ class GeminiLivePipelineSession(VoicePipelineSession):
         self._in_state = None
         self._out_state = None
         self._out_residual = bytearray()
+        self._prewarm_pcm_frames: list[bytes] = []
+        self._greeting_started = False
+        self._prewarm_greeting_done = False
+        self._prewarm_call_id: str | None = None
+        self._ws_connected_at = time.monotonic()
+        self._first_audio_logged = False
         self._caller_wants_hangup = False
         self._last_model_audio_at = 0.0
         self._user_turns = 0
@@ -48,6 +61,64 @@ class GeminiLivePipelineSession(VoicePipelineSession):
             on_interrupt=self._on_interrupt,
             on_turn_complete=self._on_turn_complete,
             on_end_call=self._on_end_call_tool,
+        )
+
+    async def attach_prepared_session(self, entry: "PreparedGeminiSession") -> bool:
+        """Attach a pre-warmed Gemini Live session and pre-rendered greeting."""
+        self._prewarm_call_id = entry.call_id
+        if not entry.ready_event.is_set():
+            try:
+                await asyncio.wait_for(entry.ready_event.wait(), timeout=2.5)
+            except asyncio.TimeoutError:
+                pass
+        if entry.agent_config is None or entry.link is None or not entry.link.ready:
+            return False
+
+        self.agent_id = entry.agent_config.agent_id
+        self.agent_config = entry.agent_config
+        self.greeting_audio_pcm = entry.agent_config.greeting_audio_pcm
+        self.lovable_token = entry.voicebot_token
+        self.call_direction = entry.direction or "outbound"
+
+        if entry.greeting_started and not entry.first_audio_event.is_set():
+            try:
+                await asyncio.wait_for(entry.first_audio_event.wait(), timeout=0.25)
+            except asyncio.TimeoutError:
+                pass
+
+        old_link = self._link
+        self._link = entry.link
+        self._out_state = entry.out_state
+        self._out_residual = bytearray(entry.out_residual)
+        self._prewarm_pcm_frames = list(entry.pcm_8k_frames)
+        self._greeting_started = entry.greeting_started
+        self._prewarm_greeting_done = entry.greeting_done
+        if entry.welcome_text:
+            self.history.append({"role": "assistant", "content": entry.welcome_text})
+
+        self._link.rebind_handlers(
+            on_audio=self._on_model_audio,
+            on_transcript=self._on_transcript,
+            on_interrupt=self._on_interrupt,
+            on_turn_complete=self._on_turn_complete,
+            on_end_call=self._on_end_call_tool,
+        )
+        if not entry.greeting_done and entry.greeting_started:
+            self._is_playing_welcome = True
+            self.is_speaking = True
+            self._last_model_audio_at = time.monotonic()
+
+        asyncio.create_task(old_link.close())
+        return True
+
+    def _log_prewarm_first_audio_if_needed(self) -> None:
+        if self._first_audio_logged or not self._prewarm_call_id:
+            return
+        self._first_audio_logged = True
+        logger.info(
+            "PREWARM event=first_audio_sent call_id=%s pickup_to_first_audio_ms=%.0f",
+            self._prewarm_call_id,
+            (time.monotonic() - self._ws_connected_at) * 1000,
         )
 
     async def on_agent_ready(self) -> None:
@@ -71,17 +142,38 @@ class GeminiLivePipelineSession(VoicePipelineSession):
         await self._link.send_pcm16k(pcm_16k)
 
     async def speak_welcome(self) -> None:
+        if self._greeting_started:
+            if self._prewarm_pcm_frames:
+                frames = list(self._prewarm_pcm_frames)
+                self._prewarm_pcm_frames.clear()
+                self._is_playing_welcome = True
+                self.is_speaking = True
+                self._last_model_audio_at = time.monotonic()
+                try:
+                    for idx, frame in enumerate(frames):
+                        if not await self.send_pcm_frame(frame):
+                            break
+                        if idx == 0:
+                            self._log_prewarm_first_audio_if_needed()
+                        await asyncio.sleep(config.CHUNK_DURATION_MS / 1000)
+                finally:
+                    if self._prewarm_greeting_done:
+                        self._is_playing_welcome = False
+                        self.is_speaking = False
+            return
         if not config.ENABLE_WELCOME_MESSAGE:
             return
         welcome = (config.WELCOME_MESSAGE or "").strip()
         if not welcome:
             return
         await self._ensure_link()
+        self._greeting_started = True
         self._is_playing_welcome = True
         self.is_speaking = True
+        self._last_model_audio_at = time.monotonic()
         await self._link.say(
-            "The phone call just connected. Say this greeting in a natural voice, "
-            f"then stop and wait: {welcome}"
+            "The phone call just connected. Speak ONLY this opening greeting "
+            f"and do NOT call any tools: {welcome}"
         )
 
     async def handle_clear(self) -> None:
@@ -112,6 +204,7 @@ class GeminiLivePipelineSession(VoicePipelineSession):
             del self._out_residual[:frame]
             if not await self.send_pcm_frame(chunk):
                 return
+            self._log_prewarm_first_audio_if_needed()
 
     async def _on_end_call_tool(self) -> None:
         if self._user_turns == 0 and not self._caller_wants_hangup:

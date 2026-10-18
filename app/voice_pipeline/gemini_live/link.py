@@ -58,6 +58,22 @@ class GeminiLiveLink:
     def ready(self) -> bool:
         return self._setup_done.is_set() and self._ws is not None
 
+    def rebind_handlers(
+        self,
+        *,
+        on_audio: AudioHandler,
+        on_transcript: TextHandler | None = None,
+        on_interrupt: InterruptHandler | None = None,
+        on_turn_complete: Callable[[], Awaitable[None]] | None = None,
+        on_end_call: EndCallHandler | None = None,
+    ) -> None:
+        """Attach an already-warmed Gemini Live link to the live call session."""
+        self._on_audio = on_audio
+        self._on_transcript = on_transcript
+        self._on_interrupt = on_interrupt
+        self._on_turn_complete = on_turn_complete
+        self._on_end_call = on_end_call
+
     async def open_socket(self) -> None:
         """Open TLS/WS to Gemini immediately (in parallel with Supabase lookup)."""
         if self._ws is not None or self._closed:

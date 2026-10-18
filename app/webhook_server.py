@@ -90,28 +90,43 @@ async def _maybe_prewarm_from_exotel_status(form: dict) -> None:
 
 
 async def _handle_prewarm(request: web.Request) -> web.Response:
-    if not _authorize_prewarm(request):
-        return web.Response(status=401, text="Unauthorized")
     try:
         body = await request.json()
     except json.JSONDecodeError:
-        return web.Response(status=400, text="Invalid JSON")
+        return web.json_response({"ok": False, "error": "invalid_json"}, status=400)
+    if not isinstance(body, dict):
+        return web.json_response({"ok": False, "error": "invalid_json"}, status=400)
 
-    token = (body.get("token") or "").strip()
+    # Outbound Gemini Live pre-warm (POST /prewarm or /voicebot/prewarm with voicebot_token)
+    voicebot_token = (body.get("voicebot_token") or "").strip()
+    if config.VOICE_PIPELINE == "gemini_live" and (
+        voicebot_token or request.path == "/prewarm"
+    ):
+        from app.voice_pipeline.gemini_live.prewarm import (
+            validate_and_schedule_gemini_prewarm,
+        )
+
+        status, payload = await validate_and_schedule_gemini_prewarm(body)
+        return web.json_response(payload, status=status)
+
+    if not _authorize_prewarm(request):
+        return web.Response(status=401, text="Unauthorized")
+
+    token = (body.get("token") or body.get("voicebot_token") or "").strip()
     number = (body.get("number") or "").strip()
     if bool(token) == bool(number):
         return web.Response(status=400, text="Provide exactly one of token or number")
 
     logger.info(
-        "🔥 Prewarm request accepted source=http key=%s",
-        token[:6] + "..." if token else f"...{number[-4:]}",
+        "🔥 Prewarm request accepted source=http call_id=%s",
+        body.get("call_id") or "none",
     )
     _schedule_prewarm(
         token=token or None,
         number=number or None,
         source="http_prewarm",
     )
-    return web.json_response({"status": "accepted"})
+    return web.json_response({"ok": True, "status": "accepted"})
 
 
 async def _handle_status(request: web.Request) -> web.Response:
@@ -151,6 +166,7 @@ def _build_app() -> web.Application:
     app = web.Application()
     app.router.add_post("/exotel/status", _handle_status)
     app.router.add_post("/exotel/conversation", _handle_conversation)
+    app.router.add_post("/prewarm", _handle_prewarm)
     app.router.add_post("/voicebot/prewarm", _handle_prewarm)
     app.router.add_get("/health", _handle_health)
     if config.VOBIZ_ENABLED:
@@ -167,7 +183,7 @@ async def start() -> web.AppRunner:
     await site.start()
     logger.info(
         "🌐 Webhook HTTP listening on http://%s:%s "
-        "(/exotel/status, /exotel/conversation, /voicebot/prewarm%s)",
+        "(/prewarm, /voicebot/prewarm, /exotel/status, /exotel/conversation%s)",
         config.HOST,
         config.WEBHOOK_PORT,
         ", /vobiz/answer, /vobiz/hangup" if config.VOBIZ_ENABLED else "",

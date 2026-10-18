@@ -213,6 +213,30 @@ def _extract_token(websocket) -> tuple[str | None, str | None]:
     return token, path
 
 
+def _extract_call_id(websocket) -> str | None:
+    """Extract ?call_id=... (or callId / call_sid) from the WebSocket request URL."""
+    path = _extract_request_path(websocket)
+    parsed = urlparse(path) if path else None
+    query = parsed.query if parsed else ""
+
+    if not query:
+        headers = _extract_request_headers(websocket)
+        for header_name in ("x-original-uri", "x-forwarded-uri", "x-original-url"):
+            header_value = headers.get(header_name)
+            if header_value and "?" in header_value:
+                query = urlparse(header_value).query
+                break
+
+    if not query:
+        return None
+    qs = parse_qs(query)
+    for key in ("call_id", "callId", "call_sid", "callSid"):
+        values = qs.get(key)
+        if values and values[0]:
+            return values[0].strip()
+    return None
+
+
 def _token_prefix(token: str | None) -> str:
     return (token or "")[:6]
 
@@ -499,6 +523,7 @@ async def handle_websocket(websocket):
             getattr(session, "pipeline_name", get_pipeline_name()),
         )
         session.wss_route_kind, session.wss_route_value, request_path = _extract_wss_route(websocket)
+        ws_call_id = _extract_call_id(websocket)
         session.lovable_token = session.wss_route_value if session.wss_route_kind == "token" else None
         logger.info(
             "🔎 WS request path for %s: %r (route=%s)",
@@ -520,7 +545,28 @@ async def handle_websocket(websocket):
         active_sessions[connection_id] = session
         _assume_channel_reserved(session)
         _log_channel_reserved(session, connection_id)
-        start_agent_prefetch(session, connection_id)
+
+        prewarm_attached = False
+        if (
+            getattr(session, "pipeline_name", "") == "gemini_live"
+            and hasattr(session, "attach_prepared_session")
+            and (ws_call_id or session.lovable_token)
+        ):
+            from app.voice_pipeline.gemini_live.prewarm import (
+                claim_prepared_gemini_session,
+            )
+
+            prepared = await claim_prepared_gemini_session(
+                call_id=ws_call_id,
+                token=session.lovable_token,
+            )
+            if prepared is not None:
+                prewarm_attached = await session.attach_prepared_session(prepared)
+                if prewarm_attached:
+                    _commit_agent_config_to_session(session)
+
+        if not prewarm_attached:
+            start_agent_prefetch(session, connection_id)
 
         async for message in websocket:
             try:
@@ -554,9 +600,30 @@ async def handle_websocket(websocket):
                 )
                 _log_call_started(session, connection_id)
 
-                agent_resolved = await _resolve_agent_on_start(
-                    session, connection_id, start_data
-                )
+                if (
+                    not prewarm_attached
+                    and getattr(session, "pipeline_name", "") == "gemini_live"
+                    and hasattr(session, "attach_prepared_session")
+                ):
+                    from app.voice_pipeline.gemini_live.prewarm import (
+                        claim_prepared_gemini_session,
+                    )
+
+                    prepared = await claim_prepared_gemini_session(
+                        call_id=session.call_sid,
+                        token=session.lovable_token,
+                    )
+                    if prepared is not None:
+                        prewarm_attached = await session.attach_prepared_session(prepared)
+                        if prewarm_attached:
+                            _commit_agent_config_to_session(session)
+
+                if prewarm_attached and session.agent_config:
+                    agent_resolved = True
+                else:
+                    agent_resolved = await _resolve_agent_on_start(
+                        session, connection_id, start_data
+                    )
                 if not agent_resolved and session.wss_route_kind not in ("number", "token"):
                     logger.error(
                         "missing voicebot token/number in wss url and no to= on start "
@@ -612,6 +679,15 @@ async def handle_websocket(websocket):
     finally:
         active_sessions.pop(connection_id, None)
         if session is not None:
+            if getattr(session, "pipeline_name", "") == "gemini_live":
+                from app.voice_pipeline.gemini_live.prewarm import (
+                    remove_prepared_gemini_session,
+                )
+
+                await remove_prepared_gemini_session(
+                    call_id=ws_call_id or session.call_sid,
+                    token=session.lovable_token,
+                )
             await _finalize_call_session(session, connection_id, end_reason)
             await session.close()
         remaining = await decrement_active_sessions()
@@ -622,6 +698,87 @@ async def handle_websocket(websocket):
             remaining,
             config.MAX_CONCURRENT_SESSIONS,
         )
+
+
+from websockets.asyncio.server import ServerConnection
+
+
+class _PrewarmAwareServerConnection(ServerConnection):
+    """
+    Allows ``POST /prewarm`` and ``POST /voicebot/prewarm`` on the main WS port
+    (8002) in addition to ``WEBHOOK_PORT`` (8081), so nginx configs that proxy
+    ``/`` to 8002 work without requiring an nginx reload.
+    """
+
+    _http_post_mode: bool = False
+    _http_post_handled: bool = False
+    _http_post_buf: bytearray | None = None
+
+    def data_received(self, data: bytes) -> None:
+        if not self._http_post_mode and self._http_post_buf is None:
+            if data.startswith((b"POST /prewarm", b"POST /voicebot/prewarm")):
+                self._http_post_mode = True
+                self._http_post_buf = bytearray(data)
+                self._try_dispatch_http_post()
+                return
+        if self._http_post_mode:
+            if self._http_post_buf is not None:
+                self._http_post_buf.extend(data)
+            self._try_dispatch_http_post()
+            return
+        super().data_received(data)
+
+    def _try_dispatch_http_post(self) -> None:
+        if self._http_post_handled or self._http_post_buf is None:
+            return
+        sep = self._http_post_buf.find(b"\r\n\r\n")
+        if sep == -1:
+            return
+        header_block = bytes(self._http_post_buf[:sep]).decode("latin-1", errors="replace")
+        content_length = 0
+        for line in header_block.split("\r\n")[1:]:
+            if ":" in line:
+                k, v = line.split(":", 1)
+                if k.strip().lower() == "content-length":
+                    try:
+                        content_length = int(v.strip())
+                    except ValueError:
+                        content_length = 0
+        body_start = sep + 4
+        if len(self._http_post_buf) < body_start + content_length:
+            return
+        self._http_post_handled = True
+        raw_body = bytes(self._http_post_buf[body_start : body_start + content_length])
+        asyncio.create_task(self._respond_prewarm_post(raw_body))
+
+    async def _respond_prewarm_post(self, raw_body: bytes) -> None:
+        status = 400
+        payload: dict = {"ok": False, "error": "invalid_json"}
+        try:
+            body = json.loads(raw_body.decode("utf-8"))
+            if isinstance(body, dict):
+                from app.voice_pipeline.gemini_live.prewarm import (
+                    validate_and_schedule_gemini_prewarm,
+                )
+
+                status, payload = await validate_and_schedule_gemini_prewarm(body)
+        except Exception:
+            status = 400
+            payload = {"ok": False, "error": "invalid_json"}
+
+        reason = {200: "OK", 400: "Bad Request", 401: "Unauthorized", 429: "Too Many Requests"}.get(
+            status, "OK"
+        )
+        resp_body = json.dumps(payload).encode("utf-8")
+        raw_resp = (
+            f"HTTP/1.1 {status} {reason}\r\n"
+            "Content-Type: application/json\r\n"
+            f"Content-Length: {len(resp_body)}\r\n"
+            "Connection: close\r\n\r\n"
+        ).encode("ascii") + resp_body
+        if self.transport is not None:
+            self.transport.write(raw_resp)
+            self.transport.close()
 
 
 async def _probe_elevenlabs_api_key() -> None:
@@ -721,6 +878,7 @@ async def main():
         ping_interval=30,
         ping_timeout=10,
         process_request=_process_request,
+        create_connection=_PrewarmAwareServerConnection,
     )
 
     webhook_runner = await webhook_server.start()

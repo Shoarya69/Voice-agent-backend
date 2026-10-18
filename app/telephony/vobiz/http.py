@@ -36,11 +36,19 @@ def _public_wss_base() -> str:
     return f"wss://{host}"
 
 
-def _wss_url_for_request(*, token: str | None, number: str | None) -> str:
+def _wss_url_for_request(
+    *,
+    token: str | None,
+    number: str | None,
+    call_id: str | None = None,
+) -> str:
     base = _public_wss_base()
     path = config.VOBIZ_WS_PATH.rstrip("/") or "/ws"
     if token:
-        return f"{base}{path}?token={quote(token, safe='')}"
+        url = f"{base}{path}?token={quote(token, safe='')}"
+        if call_id:
+            url += f"&call_id={quote(call_id, safe='')}"
+        return url
     if number:
         digits = "".join(ch for ch in number if ch.isdigit())
         return f"{base}{path}/number/{digits}"
@@ -58,6 +66,13 @@ async def handle_answer(request: web.Request) -> web.Response:
             pass
 
     token = (data.get("token") or "").strip()
+    call_id = (
+        data.get("call_id")
+        or data.get("callId")
+        or data.get("CallUUID")
+        or data.get("callUUID")
+        or ""
+    ).strip()
     to_number = (data.get("To") or data.get("to") or data.get("number") or "").strip()
     logger.info(
         "Vobiz answer webhook CallUUID=%s To=%s token=%s",
@@ -84,7 +99,7 @@ async def handle_answer(request: web.Request) -> web.Response:
 
     try:
         if token:
-            wss = _wss_url_for_request(token=token, number=None)
+            wss = _wss_url_for_request(token=token, number=None, call_id=call_id or None)
         else:
             wss = _wss_url_for_request(token=None, number=to_number)
         status_url = None

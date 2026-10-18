@@ -117,7 +117,7 @@ server {
     }
 
     # Webhooks (Exotel + Vobiz + prewarm)
-    location ~ ^/(exotel|vobiz|voicebot)/ {
+    location ~ ^/(exotel|vobiz|voicebot|prewarm) {
         proxy_pass http://127.0.0.1:8081;
         proxy_set_header Host $host;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;

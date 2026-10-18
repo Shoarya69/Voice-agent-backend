@@ -79,6 +79,7 @@ async def handle_vobiz_websocket(websocket) -> None:
         session.wss_route_kind, session.wss_route_value, request_path = (
             voice_server._extract_wss_route(websocket)
         )
+        ws_call_id = voice_server._extract_call_id(websocket)
         session.lovable_token = (
             session.wss_route_value if session.wss_route_kind == "token" else None
         )
@@ -99,30 +100,48 @@ async def handle_vobiz_websocket(websocket) -> None:
 
         voice_server._assume_channel_reserved(session)
         voice_server._log_channel_reserved(session, connection_id)
-        start_agent_prefetch(session, connection_id)
-        preconnect = getattr(session, "preconnect_socket", None)
-        if preconnect is not None:
-            asyncio.create_task(preconnect())
 
-        # Load agent before `start` so Vobiz hears playAudio within ~1–2s (not after 6s HTTP).
         agent_preloaded = False
-        if session.wss_route_kind in ("token", "number") and session.wss_route_value:
-            logger.info(
-                "⏳ Vobiz early agent prefetch conn=%s route=%s",
-                connection_id,
-                session.wss_route_kind,
+        if isinstance(session, VobizGeminiLiveSession) and (
+            ws_call_id or session.lovable_token
+        ):
+            from app.voice_pipeline.gemini_live.prewarm import (
+                claim_prepared_gemini_session,
             )
-            agent_preloaded = await voice_server._await_agent_prefetch(
-                session, connection_id
+
+            prepared = await claim_prepared_gemini_session(
+                call_id=ws_call_id,
+                token=session.lovable_token,
             )
-            if agent_preloaded:
-                voice_server._commit_agent_config_to_session(session)
-                await session.warm_playback_pipeline()
-                if (
-                    config.VOICE_PIPELINE != "gemini_live"
-                    and session._streaming.enabled
-                ):
-                    asyncio.create_task(session._streaming.ensure_stt_if_needed())
+            if prepared is not None:
+                agent_preloaded = await session.attach_prepared_session(prepared)
+                if agent_preloaded:
+                    voice_server._commit_agent_config_to_session(session)
+
+        if not agent_preloaded:
+            start_agent_prefetch(session, connection_id)
+            preconnect = getattr(session, "preconnect_socket", None)
+            if preconnect is not None:
+                asyncio.create_task(preconnect())
+
+            # Load agent before `start` so Vobiz hears playAudio within ~1–2s (not after 6s HTTP).
+            if session.wss_route_kind in ("token", "number") and session.wss_route_value:
+                logger.info(
+                    "⏳ Vobiz early agent prefetch conn=%s route=%s",
+                    connection_id,
+                    session.wss_route_kind,
+                )
+                agent_preloaded = await voice_server._await_agent_prefetch(
+                    session, connection_id
+                )
+                if agent_preloaded:
+                    voice_server._commit_agent_config_to_session(session)
+                    await session.warm_playback_pipeline()
+                    if (
+                        config.VOICE_PIPELINE != "gemini_live"
+                        and session._streaming.enabled
+                    ):
+                        asyncio.create_task(session._streaming.ensure_stt_if_needed())
 
         agent_started = False
 
@@ -164,6 +183,20 @@ async def handle_vobiz_websocket(websocket) -> None:
                         connection_id,
                     )
                 voice_server._log_call_started(session, connection_id)
+
+                if not agent_preloaded and isinstance(session, VobizGeminiLiveSession):
+                    from app.voice_pipeline.gemini_live.prewarm import (
+                        claim_prepared_gemini_session,
+                    )
+
+                    prepared = await claim_prepared_gemini_session(
+                        call_id=session.call_sid,
+                        token=session.lovable_token,
+                    )
+                    if prepared is not None:
+                        agent_preloaded = await session.attach_prepared_session(prepared)
+                        if agent_preloaded:
+                            voice_server._commit_agent_config_to_session(session)
 
                 if agent_preloaded and session.agent_config:
                     agent_resolved = True
@@ -221,6 +254,15 @@ async def handle_vobiz_websocket(websocket) -> None:
         logger.exception("❌ Vobiz connection error for %s: %s", connection_id, exc)
     finally:
         if session is not None:
+            if config.VOICE_PIPELINE == "gemini_live":
+                from app.voice_pipeline.gemini_live.prewarm import (
+                    remove_prepared_gemini_session,
+                )
+
+                await remove_prepared_gemini_session(
+                    call_id=ws_call_id or session.call_sid,
+                    token=session.lovable_token,
+                )
             await voice_server._finalize_call_session(session, connection_id, end_reason)
             await session.close()
         remaining = await decrement_active_sessions()
