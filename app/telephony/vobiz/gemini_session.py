@@ -39,6 +39,10 @@ from app.voice_pipeline.tools import gemini_live_system_instructions
 
 logger = logging.getLogger(__name__)
 
+# Cache synthesized 8 kHz PCM greetings by welcome text so subsequent calls
+# play the greeting immediately (<300ms) without waiting for Gemini synthesis.
+_synthesized_greeting_pcm_cache: dict[str, bytes] = {}
+
 
 class VobizGeminiLiveSession(VobizCompoundSession):
     """Gemini Live on a Vobiz media stream."""
@@ -63,6 +67,10 @@ class VobizGeminiLiveSession(VobizCompoundSession):
         self._last_user_transcript_at = 0.0
         self._turn_first_audio_logged = True
         self._user_turns = 0
+        self._echo_guard_mono_until = 0.0
+        self._capturing_greeting_pcm = False
+        self._captured_greeting_pcm = bytearray()
+        self._captured_greeting_key = ""
         self._drop_model_audio_until_next_turn = False
         self._greeting_playback_task: asyncio.Task | None = None
         self._barge_in = GeminiBargeInController()
@@ -133,6 +141,8 @@ class VobizGeminiLiveSession(VobizCompoundSession):
         finally:
             self._is_playing_welcome = False
             self.is_speaking = False
+            self._echo_guard_mono_until = time.monotonic() + 0.45
+            self._barge_in.on_assistant_turn_complete()
             self._arm_echo_guard()
 
     def _record_first_audio_out(self) -> None:
@@ -182,6 +192,8 @@ class VobizGeminiLiveSession(VobizCompoundSession):
         """Queue cached PCM greeting or start Gemini synthesis BEFORE Vobiz `start` arrives."""
         try:
             welcome = self._welcome_text()
+            if not self.greeting_audio_pcm and welcome in _synthesized_greeting_pcm_cache:
+                self.greeting_audio_pcm = _synthesized_greeting_pcm_cache[welcome]
             if self.greeting_audio_pcm and not self._greeting_started:
                 self._greeting_started = True
                 self._prewarm_greeting_done = True
@@ -204,6 +216,9 @@ class VobizGeminiLiveSession(VobizCompoundSession):
             self.session_ready_ms = round(
                 (time.monotonic() - self._ws_connected_at) * 1000, 1
             )
+        welcome = self._welcome_text()
+        if not self.greeting_audio_pcm and welcome in _synthesized_greeting_pcm_cache:
+            self.greeting_audio_pcm = _synthesized_greeting_pcm_cache[welcome]
         if self._ulaw_out_buffer and self._vobiz.stream_id:
             await self._drain_ulaw(force=False)
             self._record_first_audio_out()
@@ -213,12 +228,24 @@ class VobizGeminiLiveSession(VobizCompoundSession):
     async def add_audio_chunk(self, media_data: dict) -> None:
         if self._closed or not self._link.ready:
             return
+        now = time.monotonic()
         # Never stay deaf if Gemini drops turnComplete — release after 0.6s of no model audio.
         if (self.is_speaking or self._is_playing_welcome) and self._last_model_audio_at > 0:
-            if (time.monotonic() - self._last_model_audio_at) > 0.6 and not self._ulaw_out_buffer:
+            if (now - self._last_model_audio_at) > 0.6 and not self._ulaw_out_buffer:
                 self.is_speaking = False
                 self._is_playing_welcome = False
                 self._barge_in.on_assistant_turn_complete()
+                self._echo_guard_mono_until = now + 0.45
+
+        # Half-duplex / echo guard when local barge-in is disabled on telephony lines:
+        # prevents phone line echo from cutting the AI's voice or feeding back into Gemini.
+        if not config.GEMINI_BARGE_IN_ENABLED and not config.ENABLE_BARGE_IN:
+            if (
+                self.is_speaking
+                or self._is_playing_welcome
+                or now < self._echo_guard_mono_until
+            ):
+                return
 
         ulaw = decode_payload(media_data.get("payload", ""))
         if not ulaw:
@@ -244,6 +271,9 @@ class VobizGeminiLiveSession(VobizCompoundSession):
                     await self._link.send_pcm16k(chunk_16k)
             return
 
+        if now < self._echo_guard_mono_until:
+            return
+
         self._drop_model_audio_until_next_turn = False
         await self._link.send_pcm16k(pcm_16k)
 
@@ -253,6 +283,8 @@ class VobizGeminiLiveSession(VobizCompoundSession):
         welcome = self._welcome_text()
         if not welcome.strip():
             return
+        if not self.greeting_audio_pcm and welcome in _synthesized_greeting_pcm_cache:
+            self.greeting_audio_pcm = _synthesized_greeting_pcm_cache[welcome]
         self._greeting_started = True
         self.history.append({"role": "assistant", "content": welcome})
         self._barge_in.on_assistant_transcript(welcome)
@@ -269,6 +301,9 @@ class VobizGeminiLiveSession(VobizCompoundSession):
             )
             asyncio.create_task(self._connect_and_inject_greeting_context(welcome))
             return
+        self._capturing_greeting_pcm = True
+        self._captured_greeting_pcm.clear()
+        self._captured_greeting_key = welcome
         await self._link.say(
             "The phone call just connected. Speak ONLY this opening greeting "
             f"and do NOT call any tools: {welcome}"
@@ -332,6 +367,8 @@ class VobizGeminiLiveSession(VobizCompoundSession):
         pcm_8k, self._out_state = audioop.ratecv(
             pcm_24k, 2, 1, 24000, 8000, self._out_state
         )
+        if self._capturing_greeting_pcm and len(self._captured_greeting_pcm) < 128000:
+            self._captured_greeting_pcm.extend(pcm_8k)
         self._out_residual.extend(pcm_8k)
         frame = config.BYTES_PER_CHUNK
         while len(self._out_residual) >= frame:
@@ -384,12 +421,23 @@ class VobizGeminiLiveSession(VobizCompoundSession):
         await self._vobiz_finish_playback()
 
     async def _on_turn_complete(self) -> None:
+        if self._capturing_greeting_pcm:
+            self._capturing_greeting_pcm = False
+            if (
+                self._captured_greeting_key
+                and len(self._captured_greeting_pcm) >= 3200
+            ):
+                _synthesized_greeting_pcm_cache[self._captured_greeting_key] = bytes(
+                    self._captured_greeting_pcm
+                )
+            self._captured_greeting_pcm.clear()
         if self._out_residual and not self._drop_model_audio_until_next_turn:
             await self._send_paced_frame(bytes(self._out_residual))
             self._out_residual.clear()
         await self.flush_playback_output()
         self._is_playing_welcome = False
         self.is_speaking = False
+        self._echo_guard_mono_until = time.monotonic() + 0.45
         self._barge_in.on_assistant_turn_complete()
         self._arm_echo_guard()
         if (
@@ -402,6 +450,15 @@ class VobizGeminiLiveSession(VobizCompoundSession):
         self._schedule_close_after_playback_if_needed()
 
     async def _on_interrupt(self, local_barge_in: bool = False) -> None:
+        # Never cut the opening greeting on carrier noise or "call is being recorded"
+        if self._is_playing_welcome and not local_barge_in:
+            return
+        if (
+            not local_barge_in
+            and not config.GEMINI_BARGE_IN_ENABLED
+            and not config.ENABLE_BARGE_IN
+        ):
+            return
         if (
             self._greeting_playback_task is not None
             and not self._greeting_playback_task.done()
@@ -409,6 +466,8 @@ class VobizGeminiLiveSession(VobizCompoundSession):
             self._greeting_playback_task.cancel()
         if local_barge_in:
             self._drop_model_audio_until_next_turn = True
+        self._capturing_greeting_pcm = False
+        self._captured_greeting_pcm.clear()
         self._barge_in.mark_interrupted()
         self._out_residual.clear()
         self._out_state = None

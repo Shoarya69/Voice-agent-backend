@@ -524,10 +524,16 @@ async def _resolve_agent_bundle_impl(
         raise LovableClientError("missing token or number")
 
     if not base.greeting_audio_pcm and base.token:
-        pcm = await get_agent_greeting_pcm(base.token)
-        if pcm is not None:
-            base.greeting_audio_pcm = pcm
-            base.greeting_audio_hash = _token_greeting_hash.get(base.token, "")
+        # Check in-memory hash cache first; only query RPC if not an inbound number lookup
+        known_hash = _token_greeting_hash.get(base.token)
+        if known_hash and known_hash in _greeting_pcm_by_hash:
+            base.greeting_audio_pcm = _greeting_pcm_by_hash[known_hash]
+            base.greeting_audio_hash = known_hash
+        elif not number:
+            pcm = await get_agent_greeting_pcm(base.token)
+            if pcm is not None:
+                base.greeting_audio_pcm = pcm
+                base.greeting_audio_hash = _token_greeting_hash.get(base.token, "")
 
     if base.greeting_audio_pcm:
         logger.info(

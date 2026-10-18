@@ -73,7 +73,9 @@ class GeminiVoiceServerTests(unittest.IsolatedAsyncioTestCase):
 
         pcm_8k = _make_speech_pcm_8k(20)
         pcm_16k = pcm_8k * 2
-        with patch.object(ctrl, "is_frame_speech", return_value=True):
+        with patch.object(config, "GEMINI_BARGE_IN_ENABLED", True), patch.object(
+            ctrl, "is_frame_speech", return_value=True
+        ):
             # 500ms of "haan" (< 800ms) while AI is mid-explanation -> must NOT interrupt
             for _ in range(25):  # 25 * 20ms = 500ms
                 interrupted, frames = ctrl.process_caller_frame_during_playback(
@@ -84,7 +86,9 @@ class GeminiVoiceServerTests(unittest.IsolatedAsyncioTestCase):
 
         # Followed by 240ms of silence -> back-channel buffer resets without interrupting
         silence_8k = _make_silence_pcm_8k(20)
-        with patch.object(ctrl, "is_frame_speech", return_value=False):
+        with patch.object(config, "GEMINI_BARGE_IN_ENABLED", True), patch.object(
+            ctrl, "is_frame_speech", return_value=False
+        ):
             for _ in range(12):
                 interrupted, _ = ctrl.process_caller_frame_during_playback(
                     silence_8k, silence_8k * 2
@@ -103,7 +107,9 @@ class GeminiVoiceServerTests(unittest.IsolatedAsyncioTestCase):
         pcm_16k = pcm_8k * 2
         triggered = False
         flushed_frames = []
-        with patch.object(ctrl, "is_frame_speech", return_value=True):
+        with patch.object(config, "GEMINI_BARGE_IN_ENABLED", True), patch.object(
+            ctrl, "is_frame_speech", return_value=True
+        ):
             for _ in range(18):  # 360ms >= 320ms
                 interrupted, frames = ctrl.process_caller_frame_during_playback(
                     pcm_8k, pcm_16k
@@ -124,7 +130,9 @@ class GeminiVoiceServerTests(unittest.IsolatedAsyncioTestCase):
         pcm_8k = _make_speech_pcm_8k(20)
         pcm_16k = pcm_8k * 2
         triggered = False
-        with patch.object(ctrl, "is_frame_speech", return_value=True):
+        with patch.object(config, "GEMINI_BARGE_IN_ENABLED", True), patch.object(
+            ctrl, "is_frame_speech", return_value=True
+        ):
             for _ in range(42):  # 840ms >= 800ms
                 interrupted, _ = ctrl.process_caller_frame_during_playback(
                     pcm_8k, pcm_16k
