@@ -301,7 +301,7 @@ class GeminiLiveLink:
 
         if content.get("turnComplete") or content.get("generationComplete"):
             self._turn_done.set()
-            if self._on_turn_complete is not None and content.get("turnComplete"):
+            if self._on_turn_complete is not None:
                 await self._on_turn_complete()
 
     async def _handle_tool_call(self, tool_call: dict) -> None:
@@ -312,6 +312,12 @@ class GeminiLiveLink:
         for fn in calls:
             name = fn.get("name") or ""
             call_id = fn.get("id") or ""
+            logger.info(
+                "Gemini Live toolCall conn=%s name=%s id=%s",
+                self._connection_id,
+                name,
+                call_id,
+            )
             if name == END_CALL_TOOL_NAME and self._on_end_call is not None:
                 await self._on_end_call()
             responses.append(
@@ -323,6 +329,9 @@ class GeminiLiveLink:
             )
         if responses:
             await self._send({"toolResponse": {"functionResponses": responses}})
+        self._turn_done.set()
+        if self._on_turn_complete is not None:
+            await self._on_turn_complete()
 
     async def _handle_function_call(self, fn: dict) -> None:
         name = fn.get("name") or ""

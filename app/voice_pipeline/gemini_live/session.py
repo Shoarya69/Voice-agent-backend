@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import audioop
 import logging
+import time
 from typing import ClassVar
 
 from app import config
@@ -38,6 +39,8 @@ class GeminiLivePipelineSession(VoicePipelineSession):
         self._out_state = None
         self._out_residual = bytearray()
         self._caller_wants_hangup = False
+        self._last_model_audio_at = 0.0
+        self._user_turns = 0
         self._link = GeminiLiveLink(
             connection_id,
             on_audio=self._on_model_audio,
@@ -53,6 +56,10 @@ class GeminiLivePipelineSession(VoicePipelineSession):
     async def add_audio_chunk(self, media_data: dict) -> None:
         if self._closed or not self._link.ready:
             return
+        if (self.is_speaking or self._is_playing_welcome) and self._last_model_audio_at > 0:
+            if (time.monotonic() - self._last_model_audio_at) > 0.6:
+                self.is_speaking = False
+                self._is_playing_welcome = False
         if (self.is_speaking or self._is_playing_welcome) and not config.ENABLE_BARGE_IN:
             return
         pcm_8k = decode_payload(media_data.get("payload", ""))
@@ -94,6 +101,7 @@ class GeminiLivePipelineSession(VoicePipelineSession):
         if self._closed or not pcm_24k:
             return
         self.is_speaking = True
+        self._last_model_audio_at = time.monotonic()
         pcm_8k, self._out_state = audioop.ratecv(
             pcm_24k, 2, 1, 24000, 8000, self._out_state
         )
@@ -106,12 +114,16 @@ class GeminiLivePipelineSession(VoicePipelineSession):
                 return
 
     async def _on_end_call_tool(self) -> None:
+        if self._user_turns == 0 and not self._caller_wants_hangup:
+            return
         self._should_end_call = True
         logger.info("Gemini Live end_call tool conn=%s", self.connection_id)
 
     async def _on_transcript(self, role: str, text: str) -> None:
-        if role == "user" and user_requested_hangup(text):
-            self._caller_wants_hangup = True
+        if role == "user":
+            self._user_turns += 1
+            if user_requested_hangup(text):
+                self._caller_wants_hangup = True
         cleaned = self._strip_call_end_marker(text) if role == "assistant" else text
         self._append_history_message(role, cleaned)
         logger.info("Gemini Live %s (%s): %s", role, self.connection_id, cleaned[:160])
