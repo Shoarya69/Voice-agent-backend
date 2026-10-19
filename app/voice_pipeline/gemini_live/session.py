@@ -20,7 +20,7 @@ if TYPE_CHECKING:
     from app.voice_pipeline.gemini_live.prewarm import PreparedGeminiSession
 
 from app import config
-from app.audio_utils import chunk_pcm, decode_payload
+from app.audio_utils import chunk_pcm, decode_payload, resample_24k_to_8k_clean
 from app.openai_service import openai_brain
 from app.voice_pipeline.base import VoicePipelineSession
 from app.voice_pipeline.gemini_live.barge_in import GeminiBargeInController
@@ -216,9 +216,11 @@ class GeminiLivePipelineSession(VoicePipelineSession):
             self._barge_in.on_assistant_speaking_start()
         self.is_speaking = True
         self._last_model_audio_at = time.monotonic()
-        pcm_8k, self._out_state = audioop.ratecv(
-            pcm_24k, 2, 1, 24000, 8000, self._out_state
+        pcm_8k, self._out_state = resample_24k_to_8k_clean(
+            pcm_24k, self._out_state
         )
+        if not pcm_8k:
+            return
         self._out_residual.extend(pcm_8k)
         frame = config.BYTES_PER_CHUNK
         while len(self._out_residual) >= frame:

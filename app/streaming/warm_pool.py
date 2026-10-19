@@ -256,6 +256,7 @@ async def _warm_inbound_gemini_agents() -> None:
         return
     try:
         from app import lovable_client
+        from app.audio_utils import resample_24k_to_8k_clean
         from app.telephony.vobiz.gemini_session import (
             _synthesized_greeting_pcm_cache,
             save_synthesized_greeting_pcm,
@@ -265,11 +266,6 @@ async def _warm_inbound_gemini_agents() -> None:
             build_gemini_instructions_for_agent,
             build_welcome_text,
         )
-
-        try:
-            import audioop
-        except ImportError:
-            audioop = None  # type: ignore[assignment]
 
         for num in numbers:
             try:
@@ -283,7 +279,6 @@ async def _warm_inbound_gemini_agents() -> None:
                 not welcome
                 or agent_cfg.greeting_audio_pcm
                 or welcome in _synthesized_greeting_pcm_cache
-                or audioop is None
             ):
                 continue
 
@@ -294,10 +289,9 @@ async def _warm_inbound_gemini_agents() -> None:
 
             async def _on_audio(pcm_24k: bytes) -> None:
                 if pcm_24k:
-                    pcm_8k, state[0] = audioop.ratecv(
-                        pcm_24k, 2, 1, 24000, 8000, state[0]
-                    )
-                    pcm_buf.extend(pcm_8k)
+                    pcm_8k, state[0] = resample_24k_to_8k_clean(pcm_24k, state[0])
+                    if pcm_8k:
+                        pcm_buf.extend(pcm_8k)
 
             async def _on_done() -> None:
                 done_ev.set()

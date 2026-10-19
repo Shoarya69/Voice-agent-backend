@@ -27,6 +27,7 @@ from app import config
 from app.audio_utils import (
     decode_payload,
     pcm_bytes_to_ulaw,
+    resample_24k_to_8k_clean,
     scale_pcm_volume,
     ulaw_bytes_to_pcm,
 )
@@ -44,7 +45,7 @@ logger = logging.getLogger(__name__)
 
 # Cache synthesized 8 kHz PCM greetings by welcome text (in RAM + logs/ disk cache)
 # so even the first call after a container restart plays the greeting in <200ms.
-_GREETING_DISK_CACHE_PATH = os.path.join("logs", "gemini_greeting_cache.json")
+_GREETING_DISK_CACHE_PATH = os.path.join("logs", "gemini_greeting_cache_v2.json")
 _synthesized_greeting_pcm_cache: dict[str, bytes] = {}
 
 
@@ -255,9 +256,19 @@ class VobizGeminiLiveSession(VobizCompoundSession):
         except Exception as exc:
             logger.warning("Gemini Live prewarm failed conn=%s: %s", self.connection_id, exc)
 
+    async def _wait_play_lead(self) -> None:
+        """Keep ~260 ms buffered ahead on Vobiz to prevent mid-word jitter/underruns."""
+        if self._play_origin is None:
+            return
+        elapsed_ms = (time.monotonic() - self._play_origin) * 1000
+        ahead_ms = self._play_sent_ms - elapsed_ms
+        if ahead_ms > 260:
+            await asyncio.sleep((ahead_ms - 260) / 1000)
+
     async def _drain_ulaw(self, *, force: bool) -> None:
         while self._ulaw_out_buffer and not self._vobiz.closed:
-            need = 160 if self._play_sent_ms == 0 else 800
+            # 640 bytes (80ms) for fast first packet, then 1600 bytes (200ms) smooth frames
+            need = 640 if self._play_sent_ms == 0 else 1600
             if len(self._ulaw_out_buffer) < need and not force:
                 return
             take = (
@@ -443,9 +454,11 @@ class VobizGeminiLiveSession(VobizCompoundSession):
                 self.connection_id,
                 (time.monotonic() - self._last_user_transcript_at) * 1000,
             )
-        pcm_8k, self._out_state = audioop.ratecv(
-            pcm_24k, 2, 1, 24000, 8000, self._out_state
+        pcm_8k, self._out_state = resample_24k_to_8k_clean(
+            pcm_24k, self._out_state
         )
+        if not pcm_8k:
+            return
         if self._capturing_greeting_pcm and len(self._captured_greeting_pcm) < 128000:
             self._captured_greeting_pcm.extend(pcm_8k)
         self._out_residual.extend(pcm_8k)

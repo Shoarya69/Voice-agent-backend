@@ -4,6 +4,7 @@ session. Exotel voice streaming sends/expects raw PCM (signed 16-bit
 little-endian, mono, 8kHz) audio encoded as base64 - no WAV/container header.
 """
 
+import array
 import base64
 import io
 import math
@@ -210,3 +211,76 @@ def scale_pcm_volume(pcm_bytes: bytes, volume: float) -> bytes:
 
     output.extend(remainder)
     return bytes(output)
+
+
+def resample_24k_to_8k_clean(
+    pcm_24k: bytes,
+    state: tuple[bytes, int, int] | None = None,
+    gain: float = 0.85,
+) -> tuple[bytes, tuple[bytes, int, int]]:
+    """
+    Downsample 24 kHz 16-bit mono PCM to 8 kHz 16-bit mono PCM using a
+    seamless 5-tap triangular anti-aliasing filter ([1, 2, 3, 2, 1] / 9)
+    with cross-chunk sample continuity and G.711 μ-law headroom scaling.
+
+    Eliminates the metallic aliasing buzz and chunk-boundary clicks caused
+    by unfiltered 3:1 decimation on telephony streams.
+    """
+    if state is None:
+        leftover, prev2, prev1 = b"", 0, 0
+    else:
+        leftover, prev2, prev1 = state
+
+    buf = leftover + (pcm_24k or b"")
+    # 3 samples @ 24kHz (6 bytes) = 1 sample @ 8kHz (2 bytes)
+    n_bytes = len(buf) - (len(buf) % 6)
+    if n_bytes < 6:
+        return b"", (buf, prev2, prev1)
+
+    new_leftover = buf[n_bytes:]
+    samples = array.array("h")
+    samples.frombytes(buf[:n_bytes])
+    n = len(samples)
+    out_len = n // 3
+    out = array.array("h", [0] * out_len)
+
+    scale = gain / 9.0
+
+    # First 8kHz sample uses (prev2, prev1, s[0], s[1], s[2]) for seamless chunk continuity
+    v0 = int(
+        (prev2 + (prev1 << 1) + samples[0] * 3 + (samples[1] << 1) + samples[2])
+        * scale
+    )
+    out[0] = 32767 if v0 > 32767 else (-32768 if v0 < -32768 else v0)
+
+    idx = 1
+    for i in range(3, n - 3, 3):
+        val = (
+            samples[i - 2]
+            + (samples[i - 1] << 1)
+            + samples[i] * 3
+            + (samples[i + 1] << 1)
+            + samples[i + 2]
+        )
+        v = int(val * scale)
+        out[idx] = 32767 if v > 32767 else (-32768 if v < -32768 else v)
+        idx += 1
+
+    if out_len > 1:
+        i = n - 3
+        v_last = int(
+            (
+                samples[i - 2]
+                + (samples[i - 1] << 1)
+                + samples[i] * 3
+                + (samples[i + 1] << 1)
+                + samples[i + 2]
+            )
+            * scale
+        )
+        out[out_len - 1] = (
+            32767 if v_last > 32767 else (-32768 if v_last < -32768 else v_last)
+        )
+
+    return out.tobytes(), (new_leftover, samples[n - 2], samples[n - 1])
+

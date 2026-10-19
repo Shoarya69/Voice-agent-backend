@@ -21,7 +21,12 @@ except ImportError:  # Python 3.13+
     audioop = None  # type: ignore[assignment]
 
 from app import config, lovable_client
-from app.audio_utils import chunk_pcm, pcm_bytes_to_ulaw, scale_pcm_volume
+from app.audio_utils import (
+    chunk_pcm,
+    pcm_bytes_to_ulaw,
+    resample_24k_to_8k_clean,
+    scale_pcm_volume,
+)
 from app.supabase_agent_provider import normalize_language
 from app.voice_pipeline.gemini_live.link import GeminiLiveLink
 from app.voice_pipeline.tools import gemini_live_system_instructions
@@ -230,9 +235,11 @@ async def _warm_prepared_session(
                     (time.monotonic() - started) * 1000, 1
                 )
                 entry.first_audio_event.set()
-            pcm_8k, entry.out_state = audioop.ratecv(
-                pcm_24k, 2, 1, 24000, 8000, entry.out_state
+            pcm_8k, entry.out_state = resample_24k_to_8k_clean(
+                pcm_24k, entry.out_state
             )
+            if not pcm_8k:
+                return
             entry.out_residual.extend(pcm_8k)
             frame = config.BYTES_PER_CHUNK
             while len(entry.out_residual) >= frame:
