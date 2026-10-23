@@ -855,10 +855,14 @@ async def main():
             config.VAD_WORKER_THREADS,
         )
     elif pipeline == "gemini_live":
+        from app.engine_config import current_engine_config
+
+        engine = current_engine_config()
         logger.info(
-            "🧠 Gemini Live: model '%s' voice '%s' (no ElevenLabs, no ChatGPT)",
-            config.GEMINI_LIVE_MODEL,
-            config.GEMINI_LIVE_VOICE,
+            "🧠 Gemini Live: model '%s' voice '%s' key=%s (portal bootstrap, no ElevenLabs, no ChatGPT)",
+            engine.gemini_live_model if engine else "pending",
+            engine.gemini_default_voice if engine else "pending",
+            engine.masked_key() if engine else "missing",
         )
     elif pipeline == "openai_realtime":
         logger.info(

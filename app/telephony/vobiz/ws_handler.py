@@ -25,6 +25,7 @@ from app.telephony.vobiz.metadata import extract_call_sid, extract_parties, extr
 from app.telephony.vobiz.gemini_session import VobizGeminiLiveSession
 from app.telephony.vobiz.session import VobizCompoundSession
 from app.telephony.vobiz.stream import VobizStream
+from app.voice_pipeline.factory import get_pipeline_name
 
 logger = logging.getLogger(__name__)
 
@@ -155,7 +156,7 @@ async def handle_vobiz_websocket(websocket) -> None:
         )
 
         vobiz = VobizStream(websocket)
-        if config.VOICE_PIPELINE == "gemini_live":
+        if get_pipeline_name() == "gemini_live":
             session = VobizGeminiLiveSession(connection_id, websocket, vobiz)
             session.accept_ms = accept_ms
         else:
@@ -366,7 +367,7 @@ async def handle_vobiz_websocket(websocket) -> None:
             await _unregister_session_for_number(
                 registered_number or session.caller_to, session
             )
-            if config.VOICE_PIPELINE == "gemini_live":
+            if get_pipeline_name() == "gemini_live":
                 from app.voice_pipeline.gemini_live.prewarm import (
                     remove_prepared_gemini_session,
                 )

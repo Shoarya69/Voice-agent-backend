@@ -347,6 +347,10 @@ LOVABLE_APP_URL = os.getenv("LOVABLE_APP_URL", "")
 # compatibility. The primary auth for agent lookup is the per-agent token
 # passed in the WSS URL query string, handled by app/lovable_client.py.
 LOVABLE_API_SECRET = os.getenv("LOVABLE_API_SECRET", "")
+# Portal bootstrap auth (Admin → AI Keys). Same bearer as LOVABLE_API_SECRET when unset.
+VOICEBOT_SHARED_SECRET = (
+    os.getenv("VOICEBOT_SHARED_SECRET", "").strip() or LOVABLE_API_SECRET
+)
 
 
 # ---------------------------------------------------------------------------
@@ -416,9 +420,13 @@ def validate() -> list:
         warnings.append(
             f"VOICE_PIPELINE={pipeline!r} is unknown — will fall back to compound at runtime."
         )
-    if pipeline == "gemini_live" and not GEMINI_API_KEY:
+    if pipeline == "gemini_live" and not (VOICEBOT_SHARED_SECRET or LOVABLE_API_SECRET):
         warnings.append(
-            "GEMINI_API_KEY is not set — Gemini Live calls cannot speak or hear."
+            "VOICEBOT_SHARED_SECRET is not set — Gemini key/model cannot be loaded from the portal."
+        )
+    if pipeline == "gemini_live" and not LOVABLE_APP_URL:
+        warnings.append(
+            "LOVABLE_APP_URL is not set — Gemini bootstrap cannot run."
         )
     if pipeline != "gemini_live" and not OPENAI_API_KEY:
         warnings.append("OPENAI_API_KEY is not set - the agent will not be able to think/respond.")

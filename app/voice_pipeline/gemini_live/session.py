@@ -21,15 +21,13 @@ if TYPE_CHECKING:
 
 from app import config
 from app.audio_utils import chunk_pcm, decode_payload, resample_24k_to_8k_clean
-from app.openai_service import openai_brain
 from app.voice_pipeline.base import VoicePipelineSession
 from app.voice_pipeline.gemini_live.barge_in import GeminiBargeInController
 from app.voice_pipeline.gemini_live.call_end import (
     assistant_sounds_like_closing,
     user_requested_hangup,
 )
-from app.voice_pipeline.gemini_live.link import GeminiLiveLink
-from app.voice_pipeline.tools import gemini_live_system_instructions
+from app.voice_pipeline.gemini_live.link import GeminiLiveLink, connect_session
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +54,8 @@ class GeminiLivePipelineSession(VoicePipelineSession):
         self._last_model_audio_at = 0.0
         self._user_turns = 0
         self._drop_model_audio_until_next_turn = False
+        self._call_error_stage = ""
+        self._engine = None
         self._barge_in = GeminiBargeInController()
         self._link = GeminiLiveLink(
             connection_id,
@@ -79,6 +79,8 @@ class GeminiLivePipelineSession(VoicePipelineSession):
 
         self.agent_id = entry.agent_config.agent_id
         self.agent_config = entry.agent_config
+        if getattr(entry, "engine", None) is not None:
+            self._engine = entry.engine
         self.greeting_audio_pcm = entry.agent_config.greeting_audio_pcm
         self.lovable_token = entry.voicebot_token
         self.call_direction = entry.direction or "outbound"
@@ -206,8 +208,18 @@ class GeminiLivePipelineSession(VoicePipelineSession):
     async def _ensure_link(self) -> None:
         if self._link.ready:
             return
-        base = openai_brain._messages([])[0]["content"]
-        await self._link.connect(gemini_live_system_instructions(base))
+        try:
+            await connect_session(self._link, self)
+        except Exception as exc:
+            from app.engine_config import GeminiAuthError
+
+            if isinstance(exc, GeminiAuthError):
+                self._call_error_stage = "gemini_auth"
+                try:
+                    await self.websocket.close(code=1000, reason="gemini auth failed")
+                except Exception:
+                    pass
+            raise
 
     async def _on_model_audio(self, pcm_24k: bytes) -> None:
         if self._closed or not pcm_24k or self._drop_model_audio_until_next_turn:

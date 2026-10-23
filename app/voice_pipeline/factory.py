@@ -19,9 +19,14 @@ _REGISTERED_PIPELINES: dict[str, str] = {
 
 
 def get_pipeline_name() -> str:
-    """Normalized active pipeline name (always ``compound`` when unset)."""
-    name = (config.VOICE_PIPELINE or "compound").strip().lower()
-    return name if name in _REGISTERED_PIPELINES else "compound"
+    """Active pipeline. Portal engine is Gemini Live for every call."""
+    name = (config.VOICE_PIPELINE or "gemini_live").strip().lower()
+    if name != "gemini_live":
+        logger.info(
+            "VOICE_PIPELINE=%s ignored — calls use gemini_live (portal engine)",
+            name,
+        )
+    return "gemini_live"
 
 
 def create_voice_pipeline_session(
@@ -35,11 +40,7 @@ def create_voice_pipeline_session(
     """
     pipeline = get_pipeline_name()
     if pipeline not in _REGISTERED_PIPELINES:
-        logger.warning(
-            "Unknown VOICE_PIPELINE=%r — falling back to compound",
-            config.VOICE_PIPELINE,
-        )
-        pipeline = "compound"
+        pipeline = "gemini_live"
 
     module_path, class_name = _REGISTERED_PIPELINES[pipeline].rsplit(".", 1)
     import importlib

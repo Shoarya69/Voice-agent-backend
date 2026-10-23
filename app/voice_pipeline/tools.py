@@ -37,19 +37,32 @@ def build_gemini_live_tools() -> list:
     ]
 
 
-def gemini_live_system_instructions(system_prompt: str) -> str:
+def gemini_live_system_instructions(
+    system_prompt: str,
+    *,
+    language: str = "",
+    closing_message: str = "",
+) -> str:
     from app import config
 
+    start_language = (language or "").strip()
+    if start_language:
+        language_rule = (
+            f"Start the call in {start_language}. "
+            "Reply in the caller's language. If they switch language, switch with them."
+        )
+    else:
+        language_rule = (
+            "Reply in the caller's language. Match the language they are speaking."
+        )
+    closing = (closing_message or "").strip()
+    closing_rule = f" When the call ends, you may close with: {closing}" if closing else ""
     return (
         f"{system_prompt}\n\n"
         "--- GEMINI LIVE PHONE RULES ---\n"
-        "Speak with a warm, natural, conversational Indian Hinglish/Hindi phone voice — "
-        "like a real human executive talking on a call. "
-        "CRITICAL LANGUAGE RULE: Always reply in Hindi/Hinglish unless the caller explicitly "
-        "speaks a full sentence in English. Never switch to English or Spanish on short/unclear audio. "
-        "If caller audio is unclear or just background noise, politely ask in Hindi: "
-        "'Maaf kijiye, aapki aawaz clear nahi aayi, kya aap dobara bolenge?' "
-        "Ignore any automated carrier announcements like 'this call is now being recorded'. "
+        "Speak like a person on a live phone call, warm and clear. "
+        f"{language_rule}{closing_rule} "
+        "Ignore automated carrier announcements such as 'this call is now being recorded'. "
         "Ask only one short question at a time and wait for the caller to reply.\n"
         f"{config.GEMINI_LIVE_CALL_END_INSTRUCTION}"
     )

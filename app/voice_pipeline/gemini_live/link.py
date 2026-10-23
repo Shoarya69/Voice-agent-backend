@@ -16,6 +16,12 @@ import websockets
 import websockets.exceptions
 
 from app import config
+from app.engine_config import (
+    GeminiAuthError,
+    get_engine_config,
+    is_gemini_auth_failure,
+    mask_secret,
+)
 from app.voice_pipeline.tools import END_CALL_TOOL_NAME, build_gemini_live_tools
 
 logger = logging.getLogger(__name__)
@@ -53,6 +59,12 @@ class GeminiLiveLink:
         self._turn_done.set()
         self._connect_lock = asyncio.Lock()
         self._closed = False
+        self._api_key = ""
+        self._model = ""
+        self._voice = ""
+        self._auth_retried = False
+        self._auth_failed = False
+        self._last_close_reason = ""
 
     @property
     def ready(self) -> bool:
@@ -78,32 +90,47 @@ class GeminiLiveLink:
         """Open TLS/WS to Gemini immediately (in parallel with Supabase lookup)."""
         if self._ws is not None or self._closed:
             return
-        if not config.GEMINI_API_KEY:
-            raise RuntimeError("GEMINI_API_KEY is not configured")
+        engine = await get_engine_config()
+        if not self._api_key:
+            self._api_key = engine.gemini_api_key
+        if not self._model:
+            self._model = engine.gemini_live_model
+        if not self._voice:
+            self._voice = engine.gemini_default_voice
+        if not self._api_key:
+            raise GeminiAuthError("Gemini API key is not configured")
         from app.streaming import warm_pool
 
-        borrowed = await warm_pool.borrow_gemini_socket()
+        borrowed = await warm_pool.borrow_gemini_socket(expected_key=self._api_key)
         if borrowed is not None:
             self._ws = borrowed
             return
-        url = (
-            f"{config.GEMINI_LIVE_WS_URL}"
-            f"?key={config.GEMINI_API_KEY}"
-        )
-        self._ws = await websockets.connect(
-            url,
-            ping_interval=20,
-            ping_timeout=10,
-            max_size=16 * 1024 * 1024,
-        )
+        self._ws = await self._connect_ws(self._api_key)
+
+    async def _connect_ws(self, api_key: str):
+        url = f"{config.GEMINI_LIVE_WS_URL}?key={api_key}"
+        try:
+            return await websockets.connect(
+                url,
+                ping_interval=20,
+                ping_timeout=10,
+                max_size=16 * 1024 * 1024,
+            )
+        except Exception as exc:
+            if is_gemini_auth_failure(exc):
+                raise GeminiAuthError("Gemini WebSocket rejected the API key") from exc
+            raise
 
     async def _send_Setup(self, instructions: str, *, disable_thinking: bool = True) -> None:
+        model = self._model
+        if model.startswith("models/"):
+            model = model[len("models/") :]
         gen_cfg: dict = {
             "responseModalities": ["AUDIO"],
             "speechConfig": {
                 "voiceConfig": {
                     "prebuiltVoiceConfig": {
-                        "voiceName": config.GEMINI_LIVE_VOICE,
+                        "voiceName": self._voice or "Kore",
                     }
                 }
             },
@@ -114,7 +141,7 @@ class GeminiLiveLink:
         await self._send(
             {
                 "setup": {
-                    "model": f"models/{config.GEMINI_LIVE_MODEL}",
+                    "model": f"models/{model}",
                     "generationConfig": gen_cfg,
                     "systemInstruction": {
                         "parts": [{"text": instructions}],
@@ -133,53 +160,100 @@ class GeminiLiveLink:
             }
         )
 
-    async def connect(self, instructions: str) -> None:
+    async def connect(
+        self,
+        instructions: str,
+        *,
+        api_key: str = "",
+        model: str = "",
+        voice: str = "",
+    ) -> None:
+        if api_key:
+            self._api_key = api_key
+        if model:
+            self._model = model
+        if voice:
+            self._voice = voice
+        try:
+            await self._connect_once(instructions)
+        except GeminiAuthError:
+            if self._auth_retried or self._closed:
+                raise
+            self._auth_retried = True
+            logger.warning(
+                "Gemini auth failed conn=%s model=%s — refreshing portal bootstrap once",
+                self._connection_id,
+                self._model,
+            )
+            fresh = await get_engine_config(force=True)
+            self._api_key = fresh.gemini_api_key
+            self._model = fresh.gemini_live_model
+            await self._reset_socket()
+            await self._connect_once(instructions)
+
+    async def _reset_socket(self) -> None:
+        if self._reader is not None:
+            self._reader.cancel()
+            self._reader = None
+        if self._ws is not None:
+            try:
+                await self._ws.close()
+            except Exception:
+                pass
+            self._ws = None
+        self._setup_done.clear()
+        self._setup_ok = False
+        self._auth_failed = False
+        self._last_close_reason = ""
+
+    async def _connect_once(self, instructions: str) -> None:
         if self.ready or self._closed:
             return
         async with self._connect_lock:
             if self.ready or self._closed:
                 return
-            await self.open_socket()
-            if self._reader is None or self._reader.done():
-                self._reader = asyncio.create_task(self._read_loop())
-            await self._send_Setup(instructions)
             try:
-                await asyncio.wait_for(self._setup_done.wait(), timeout=4.0)
-            except asyncio.TimeoutError:
-                pass
-            if not self._setup_ok or self._ws is None:
-                # Pooled socket may have gone stale — open one fresh socket and retry once.
-                if self._reader is not None:
-                    self._reader.cancel()
+                await self.open_socket()
+                if self._reader is None or self._reader.done():
+                    self._reader = asyncio.create_task(self._read_loop())
+                await self._send_Setup(instructions)
                 try:
-                    if self._ws is not None:
-                        await self._ws.close()
-                except Exception:
+                    await asyncio.wait_for(self._setup_done.wait(), timeout=4.0)
+                except asyncio.TimeoutError:
                     pass
-                self._ws = None
-                self._setup_done.clear()
-                self._setup_ok = False
-                url = f"{config.GEMINI_LIVE_WS_URL}?key={config.GEMINI_API_KEY}"
-                self._ws = await websockets.connect(
-                    url,
-                    ping_interval=20,
-                    ping_timeout=10,
-                    max_size=16 * 1024 * 1024,
+                if self._auth_failed:
+                    raise GeminiAuthError(
+                        self._last_close_reason or "Gemini Live rejected the API key"
+                    )
+                if not self._setup_ok or self._ws is None:
+                    await self._reset_socket()
+                    self._ws = await self._connect_ws(self._api_key)
+                    self._reader = asyncio.create_task(self._read_loop())
+                    await self._send_Setup(instructions, disable_thinking=False)
+                    await asyncio.wait_for(self._setup_done.wait(), timeout=6.0)
+            except GeminiAuthError:
+                raise
+            except Exception as exc:
+                if is_gemini_auth_failure(exc):
+                    raise GeminiAuthError("Gemini Live setup rejected the API key") from exc
+                raise
+            if self._auth_failed:
+                raise GeminiAuthError(
+                    self._last_close_reason or "Gemini Live rejected the API key"
                 )
-                self._reader = asyncio.create_task(self._read_loop())
-                await self._send_Setup(instructions, disable_thinking=False)
-                await asyncio.wait_for(self._setup_done.wait(), timeout=6.0)
             if not self._setup_ok or self._ws is None:
                 raise RuntimeError(
                     "Gemini Live setup rejected "
-                    f"(model={config.GEMINI_LIVE_MODEL}). Check GEMINI_API_KEY and GEMINI_LIVE_MODEL."
+                    f"(model={self._model})."
                 )
             logger.info(
-                "Gemini Live ready conn=%s model=%s voice=%s",
+                "Gemini Live ready conn=%s model=%s voice=%s key=%s",
                 self._connection_id,
-                config.GEMINI_LIVE_MODEL,
-                config.GEMINI_LIVE_VOICE,
+                self._model,
+                self._voice,
+                mask_secret(self._api_key),
             )
+
 
     async def send_pcm16k(self, pcm: bytes) -> None:
         if not pcm or self._closed or not self.ready:
@@ -273,11 +347,14 @@ class GeminiLiveLink:
         except asyncio.CancelledError:
             raise
         except websockets.exceptions.ConnectionClosed as exc:
+            self._last_close_reason = str(getattr(exc, "reason", "") or "")
+            if is_gemini_auth_failure(exc):
+                self._auth_failed = True
             logger.error(
                 "Gemini Live socket closed conn=%s code=%s reason=%s",
                 self._connection_id,
                 getattr(exc, "code", None),
-                getattr(exc, "reason", None),
+                self._last_close_reason[:180],
             )
         except Exception as exc:
             logger.error("Gemini Live reader failed conn=%s: %s", self._connection_id, exc)
@@ -393,6 +470,44 @@ class GeminiLiveLink:
                     }
                 }
             )
+
+
+
+async def connect_session(link: GeminiLiveLink, session) -> None:
+    """Open Gemini for one call using that call's engine snapshot and agent voice."""
+    engine = getattr(session, "_engine", None)
+    if engine is None:
+        engine = await get_engine_config()
+        session._engine = engine
+    agent = getattr(session, "agent_config", None)
+    if agent is not None and (getattr(agent, "system_prompt", "") or "").strip():
+        from app.voice_pipeline.gemini_live.prewarm import build_gemini_instructions_for_agent
+
+        instructions = build_gemini_instructions_for_agent(agent)
+        voice = agent.gemini_voice_name(engine.gemini_default_voice)
+    else:
+        from app.openai_service import openai_brain
+        from app.voice_pipeline.tools import gemini_live_system_instructions
+
+        base = openai_brain._messages([])[0]["content"]
+        instructions = gemini_live_system_instructions(base)
+        voice = engine.gemini_default_voice
+    try:
+        await link.connect(
+            instructions,
+            api_key=engine.gemini_api_key,
+            model=engine.gemini_live_model,
+            voice=voice,
+        )
+    except GeminiAuthError:
+        session._call_error_stage = "gemini_auth"
+        logger.error(
+            "Gemini auth failed conn=%s model=%s key=%s",
+            getattr(session, "connection_id", ""),
+            engine.gemini_live_model,
+            engine.masked_key(),
+        )
+        raise
 
 
 def _transcript_text(node) -> str:

@@ -75,7 +75,11 @@ def build_gemini_instructions_for_agent(
         f"{config.CALL_BEHAVIOR_INSTRUCTION}\n\n"
         f"{config.CALL_END_INSTRUCTION}"
     )
-    return gemini_live_system_instructions(full_prompt)
+    return gemini_live_system_instructions(
+        full_prompt,
+        language=agent_config.language,
+        closing_message=agent_config.closing_message,
+    )
 
 
 def _merge_inline_agent_overrides(
@@ -121,6 +125,9 @@ def _merge_inline_agent_overrides(
         speed=base.speed,
         tone=base.tone,
         greeting_audio_pcm=base.greeting_audio_pcm,
+        greeting_audio_hash=base.greeting_audio_hash,
+        closing_message=base.closing_message,
+        gemini_voice=base.gemini_voice or voice_id,
         channel_reservation_id=base.channel_reservation_id,
         phone_number_id=base.phone_number_id,
     )
@@ -135,6 +142,7 @@ class PreparedGeminiSession:
     created_at: float = field(default_factory=time.monotonic)
     expires_at: float = 0.0
     agent_config: lovable_client.AgentConfig | None = None
+    engine: object | None = None
     welcome_text: str = ""
     link: GeminiLiveLink | None = None
 
@@ -284,7 +292,21 @@ async def _warm_prepared_session(
             on_turn_complete=_on_turn_complete,
         )
         entry.link = link
-        await link.connect(instructions)
+        from app.engine_config import get_engine_config
+
+        engine = await get_engine_config()
+        entry.engine = engine
+        voice = (
+            entry.agent_config.gemini_voice_name(engine.gemini_default_voice)
+            if entry.agent_config is not None
+            else engine.gemini_default_voice
+        )
+        await link.connect(
+            instructions,
+            api_key=engine.gemini_api_key,
+            model=engine.gemini_live_model,
+            voice=voice,
+        )
         entry.gemini_setup_ms = round((time.monotonic() - started) * 1000, 1)
         entry.ready_event.set()
 

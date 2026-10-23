@@ -131,8 +131,14 @@ class AgentConfig:
     tone: str = ""
     greeting_audio_pcm: bytes | None = None
     greeting_audio_hash: str = ""
+    closing_message: str = ""
+    gemini_voice: str = ""
     channel_reservation_id: str = ""
     phone_number_id: str = ""
+
+    def gemini_voice_name(self, default_voice: str) -> str:
+        """Portal ``engine.voice``, else legacy voice id, else bootstrap default."""
+        return (self.gemini_voice or self.voice_id or default_voice or "").strip()
 
     def as_overrides(self) -> dict:
         """Fields consumed by app.config's per-call override mechanism."""
@@ -284,6 +290,7 @@ async def get_agent_greeting_pcm(voicebot_token: str) -> bytes | None:
 
 def _parse_agent_config_payload(payload: dict, token: str = "") -> AgentConfig:
     greeting = payload.get("greeting") or {}
+    engine = payload.get("engine") if isinstance(payload.get("engine"), dict) else {}
     resolved_token = payload.get("token") or payload.get("voicebot_token") or token
     greeting_pcm, greeting_hash = _decode_greeting_pcm(
         greeting,
@@ -291,21 +298,30 @@ def _parse_agent_config_payload(payload: dict, token: str = "") -> AgentConfig:
         token=resolved_token,
     )
     first_message = payload.get("first_message") or greeting.get("text") or ""
+    language = str(engine.get("language") or payload.get("language") or "").strip()
+    gemini_voice = str(engine.get("voice") or "").strip()
+    voice_id = str(payload.get("voice_id") or gemini_voice or "").strip()
+    try:
+        speed = float(engine.get("speed") if engine.get("speed") is not None else payload.get("speed", 1.0))
+    except (TypeError, ValueError):
+        speed = 1.0
 
     return AgentConfig(
         agent_id=payload["agent_id"],
         token=resolved_token,
         user_id=payload.get("user_id", ""),
         system_prompt=payload.get("system_prompt") or "",
-        voice_id=payload.get("voice_id") or "",
+        voice_id=voice_id,
         first_message=first_message,
-        language=payload.get("language") or "",
+        language=language,
         temperature=float(payload.get("temperature", 0.6)),
         max_tokens=int(payload.get("max_tokens", 45)),
-        speed=float(payload.get("speed", 1.0)),
+        speed=speed,
         tone=payload.get("tone") or "",
         greeting_audio_pcm=greeting_pcm,
         greeting_audio_hash=greeting_hash,
+        closing_message=str(payload.get("closing_message") or "").strip(),
+        gemini_voice=gemini_voice,
         channel_reservation_id=(
             payload.get("channel_reservation_id")
             or payload.get("channel_id")

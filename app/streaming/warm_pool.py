@@ -201,11 +201,14 @@ async def release_stt(provider: ElevenLabsStreamingSTTProvider) -> None:
 
 
 async def _open_gemini_socket():
-    if not config.GEMINI_API_KEY:
-        return None
+    from app.engine_config import get_engine_config, note_pooled_gemini_key
     import websockets
 
-    url = f"{config.GEMINI_LIVE_WS_URL}?key={config.GEMINI_API_KEY}"
+    engine = await get_engine_config()
+    if not engine.gemini_api_key:
+        return None
+    note_pooled_gemini_key(engine.gemini_api_key)
+    url = f"{config.GEMINI_LIVE_WS_URL}?key={engine.gemini_api_key}"
     try:
         return await websockets.connect(
             url,
@@ -214,12 +217,41 @@ async def _open_gemini_socket():
             max_size=16 * 1024 * 1024,
         )
     except Exception as exc:
-        logger.warning("Gemini Live socket warm failed: %s", exc)
+        logger.warning("Gemini Live socket warm failed: %s", type(exc).__name__)
         return None
 
 
+async def _drain_gemini_pool() -> None:
+    while not _gemini_ws_pool.empty():
+        try:
+            ws = _gemini_ws_pool.get_nowait()
+        except asyncio.QueueEmpty:
+            break
+        try:
+            await ws.close()
+        except Exception:
+            pass
+
+
+async def refill_gemini_pool_for_new_key() -> None:
+    """Drop idle sockets opened with a previous key. Live calls are not in this queue."""
+    from app.voice_pipeline.factory import get_pipeline_name
+
+    if get_pipeline_name() != "gemini_live":
+        return
+    async with _pool_lock:
+        await _drain_gemini_pool()
+    await _fill_gemini_pool()
+
+
 async def _fill_gemini_pool() -> int:
-    if config.VOICE_PIPELINE != "gemini_live" or not config.GEMINI_API_KEY:
+    from app.engine_config import current_engine_config, get_engine_config
+    from app.voice_pipeline.factory import get_pipeline_name
+
+    if get_pipeline_name() != "gemini_live":
+        return _gemini_ws_pool.qsize()
+    engine = current_engine_config() or await get_engine_config()
+    if not engine.gemini_api_key:
         return _gemini_ws_pool.qsize()
     target = max(1, config.VOBIZ_TTS_POOL_SIZE)
     async with _pool_lock:
@@ -231,7 +263,11 @@ async def _fill_gemini_pool() -> int:
     return _gemini_ws_pool.qsize()
 
 
-async def borrow_gemini_socket():
+async def borrow_gemini_socket(expected_key: str = ""):
+    from app.engine_config import pooled_gemini_key
+
+    if expected_key and pooled_gemini_key() and pooled_gemini_key() != expected_key:
+        return None
     while not _gemini_ws_pool.empty():
         try:
             ws = _gemini_ws_pool.get_nowait()
@@ -302,7 +338,15 @@ async def _warm_inbound_gemini_agents() -> None:
                 on_turn_complete=_on_done,
             )
             try:
-                await link.connect(build_gemini_instructions_for_agent(agent_cfg))
+                from app.engine_config import get_engine_config
+
+                engine = await get_engine_config()
+                await link.connect(
+                    build_gemini_instructions_for_agent(agent_cfg),
+                    api_key=engine.gemini_api_key,
+                    model=engine.gemini_live_model,
+                    voice=agent_cfg.gemini_voice_name(engine.gemini_default_voice),
+                )
                 await link.say(
                     "The phone call just connected. Speak ONLY this opening greeting "
                     f"and do NOT call any tools: {welcome}"
@@ -324,11 +368,13 @@ async def _warm_inbound_gemini_agents() -> None:
 
 
 async def _maintain_loop() -> None:
+    from app.voice_pipeline.factory import get_pipeline_name
+
     interval = max(60, config.VOBIZ_WARM_POOL_REFRESH_SEC)
     while True:
         await asyncio.sleep(interval)
         await _prime_supabase()
-        if config.VOICE_PIPELINE == "gemini_live":
+        if get_pipeline_name() == "gemini_live":
             await _fill_gemini_pool()
             asyncio.create_task(_warm_inbound_gemini_agents())
         else:
@@ -346,11 +392,28 @@ def start_background_warm_pool() -> None:
 
 
 async def warm_on_process_start() -> None:
+    from app.engine_config import get_engine_config, start_engine_config_refresh
+    from app.voice_pipeline.factory import get_pipeline_name
+
     if not config.VOBIZ_WARM_POOL_ENABLED:
         return
 
     supabase_ok = await _prime_supabase()
-    if config.VOICE_PIPELINE == "gemini_live":
+    if get_pipeline_name() == "gemini_live":
+        try:
+            engine = await get_engine_config()
+            start_engine_config_refresh()
+            logger.info(
+                "Gemini engine from portal model=%s voice=%s key=%s",
+                engine.gemini_live_model,
+                engine.gemini_default_voice,
+                engine.masked_key(),
+            )
+        except Exception as exc:
+            logger.error(
+                "Gemini bootstrap failed at startup — calls cannot speak until the portal answers: %s",
+                type(exc).__name__,
+            )
         try:
             from app import lovable_client
 

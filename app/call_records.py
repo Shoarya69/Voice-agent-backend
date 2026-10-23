@@ -140,8 +140,11 @@ def build_call_log_payload(
         "started_at": iso_z(started_at),
         "ended_at": iso_z(ended_at),
         "transcript": transcript,
-        "status": "completed",
+        "status": "failed" if getattr(session, "_call_error_stage", "") else "completed",
     }
+    error_stage = getattr(session, "_call_error_stage", "") or ""
+    if error_stage:
+        payload["error_stage"] = error_stage
     if recording_url:
         payload["recording_url"] = recording_url
     if outcome:

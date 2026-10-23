@@ -27,6 +27,7 @@ from aiohttp import web
 
 from app import call_records, config, lovable_client
 from app.telephony.vobiz import http as vobiz_http
+from app.voice_pipeline.factory import get_pipeline_name
 
 logger = logging.getLogger(__name__)
 
@@ -99,7 +100,7 @@ async def _handle_prewarm(request: web.Request) -> web.Response:
 
     # Outbound Gemini Live pre-warm (POST /prewarm or /voicebot/prewarm with voicebot_token)
     voicebot_token = (body.get("voicebot_token") or "").strip()
-    if config.VOICE_PIPELINE == "gemini_live" and (
+    if get_pipeline_name() == "gemini_live" and (
         voicebot_token or request.path == "/prewarm"
     ):
         from app.voice_pipeline.gemini_live.prewarm import (
