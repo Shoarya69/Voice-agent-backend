@@ -41,6 +41,24 @@ from app.voice_pipeline.gemini_live.link import GeminiLiveLink, connect_session
 
 logger = logging.getLogger(__name__)
 
+_NOISE_TRANSCRIPT = (
+    "<noise>",
+    "[noise]",
+    "(noise)",
+    "noise",
+    "<silence>",
+    "[silence]",
+    "<unk>",
+    "unk",
+)
+
+
+def _is_noise_transcript(text: str) -> bool:
+    cleaned = (text or "").strip().lower()
+    if not cleaned:
+        return True
+    return cleaned in _NOISE_TRANSCRIPT
+
 # Cache synthesized 8 kHz PCM greetings by welcome text (in RAM + logs/ disk cache)
 # so even the first call after a container restart plays the greeting in <200ms.
 _GREETING_DISK_CACHE_PATH = os.path.join("logs", "gemini_greeting_cache_v2.json")
@@ -241,7 +259,11 @@ class VobizGeminiLiveSession(VobizCompoundSession):
         """Connect Gemini Live in background while cached PCM greeting plays."""
         try:
             await self._ensure_link()
-            await self._link.inject_assistant_greeting_context(welcome)
+            await self._link.inject_assistant_greeting_context(
+                f"{welcome}\n"
+                "The caller already heard this greeting on the phone. "
+                "Do not say it again. If they only say hello, ask one short question."
+            )
         except Exception as exc:
             logger.warning(
                 "Background Gemini Live connect during cached greeting failed conn=%s: %s",
@@ -308,6 +330,7 @@ class VobizGeminiLiveSession(VobizCompoundSession):
             block = bytes(self._ulaw_out_buffer[:take])
             del self._ulaw_out_buffer[:take]
             await self._vobiz.play_ulaw(block)
+            self._record_first_audio_out()
             now = time.monotonic()
             if self._play_origin is None:
                 self._play_origin = now
@@ -350,8 +373,13 @@ class VobizGeminiLiveSession(VobizCompoundSession):
         )
 
         now = time.monotonic()
-        # Ignore carrier "this call is now being recorded" during the first 1.5s of connect
-        if (now - self._ws_connected_at) < 1.5 and self._user_turns == 0:
+        # Opening greeting must finish. Phone echo during it is not the caller.
+        greeting_on_phone = self._is_playing_welcome or (
+            self._greeting_started
+            and self._user_turns == 0
+            and now < (self._playback_active_until_mono + 0.7)
+        )
+        if greeting_on_phone:
             return
 
         # Once caller barges in, stream their entire utterance uninterrupted for 3.5s
@@ -536,6 +564,16 @@ class VobizGeminiLiveSession(VobizCompoundSession):
         logger.info("Gemini Live end_call tool conn=%s", self.connection_id)
 
     async def _on_transcript(self, role: str, text: str) -> None:
+        if role == "user" and _is_noise_transcript(text):
+            self._drop_model_audio_until_next_turn = True
+            self._out_residual.clear()
+            self._ulaw_out_buffer.clear()
+            logger.info(
+                "Ignoring noise transcript conn=%s text=%s",
+                self.connection_id,
+                (text or "")[:40],
+            )
+            return
         if role == "user":
             self._user_turns += 1
             self._last_user_transcript_at = time.monotonic()
@@ -584,7 +622,10 @@ class VobizGeminiLiveSession(VobizCompoundSession):
                 )
             )
             self._out_residual.clear()
-        if self._ulaw_out_buffer and self._vobiz.stream_id:
+        if self._drop_model_audio_until_next_turn:
+            self._ulaw_out_buffer.clear()
+            self._out_residual.clear()
+        elif self._ulaw_out_buffer and self._vobiz.stream_id:
             await self._drain_ulaw(force=True)
         self._play_origin = None
         self._play_sent_ms = 0.0
