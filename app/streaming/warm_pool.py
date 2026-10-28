@@ -294,7 +294,7 @@ async def _warm_inbound_gemini_agents() -> None:
         from app import lovable_client
         from app.audio_utils import resample_24k_to_8k_clean
         from app.telephony.vobiz.gemini_session import (
-            _synthesized_greeting_pcm_cache,
+            cached_greeting_pcm,
             save_synthesized_greeting_pcm,
         )
         from app.voice_pipeline.gemini_live.link import GeminiLiveLink
@@ -314,7 +314,11 @@ async def _warm_inbound_gemini_agents() -> None:
             if (
                 not welcome
                 or agent_cfg.greeting_audio_pcm
-                or welcome in _synthesized_greeting_pcm_cache
+                or cached_greeting_pcm(
+                    agent_cfg.agent_id,
+                    agent_cfg.greeting_audio_hash,
+                    welcome,
+                )
             ):
                 continue
 
@@ -353,7 +357,12 @@ async def _warm_inbound_gemini_agents() -> None:
                 )
                 await asyncio.wait_for(done_ev.wait(), timeout=6.0)
                 if len(pcm_buf) >= 3200:
-                    save_synthesized_greeting_pcm(welcome, bytes(pcm_buf))
+                    save_synthesized_greeting_pcm(
+                        welcome,
+                        bytes(pcm_buf),
+                        agent_id=agent_cfg.agent_id,
+                        greeting_hash=agent_cfg.greeting_audio_hash,
+                    )
                     logger.info(
                         "🎵 Startup pre-synthesized Gemini greeting agent_id=%s bytes=%s",
                         agent_cfg.agent_id,

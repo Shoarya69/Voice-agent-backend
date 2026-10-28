@@ -66,10 +66,31 @@ def _load_greeting_disk_cache() -> None:
         logger.debug("Greeting disk cache load skipped: %s", exc)
 
 
-def save_synthesized_greeting_pcm(welcome_text: str, pcm_8k: bytes) -> None:
+def greeting_cache_key(agent_id: str, greeting_hash: str, welcome_text: str) -> str:
+    """Per-agent key so one customer's greeting is never played for another."""
+    ident = (agent_id or "").strip() or "unknown"
+    tag = (greeting_hash or "").strip() or (welcome_text or "").strip()
+    return f"{ident}|{tag}"
+
+
+def cached_greeting_pcm(agent_id: str, greeting_hash: str, welcome_text: str) -> bytes | None:
+    return _synthesized_greeting_pcm_cache.get(
+        greeting_cache_key(agent_id, greeting_hash, welcome_text)
+    )
+
+
+def save_synthesized_greeting_pcm(
+    welcome_text: str,
+    pcm_8k: bytes,
+    *,
+    agent_id: str = "",
+    greeting_hash: str = "",
+) -> None:
     if not welcome_text or not pcm_8k or len(pcm_8k) < 3200:
         return
-    _synthesized_greeting_pcm_cache[welcome_text] = pcm_8k
+    _synthesized_greeting_pcm_cache[
+        greeting_cache_key(agent_id, greeting_hash, welcome_text)
+    ] = pcm_8k
     try:
         os.makedirs(os.path.dirname(_GREETING_DISK_CACHE_PATH), exist_ok=True)
         serialized = {
@@ -239,8 +260,13 @@ class VobizGeminiLiveSession(VobizCompoundSession):
         """Queue cached PCM greeting or start Gemini synthesis BEFORE Vobiz `start` arrives."""
         try:
             welcome = self._welcome_text()
-            if not self.greeting_audio_pcm and welcome in _synthesized_greeting_pcm_cache:
-                self.greeting_audio_pcm = _synthesized_greeting_pcm_cache[welcome]
+            cached = cached_greeting_pcm(
+                getattr(self, "agent_id", "") or "",
+                getattr(getattr(self, "agent_config", None), "greeting_audio_hash", "") or "",
+                welcome,
+            )
+            if not self.greeting_audio_pcm and cached:
+                self.greeting_audio_pcm = cached
             if self.greeting_audio_pcm and not self._greeting_started:
                 self._greeting_started = True
                 self._prewarm_greeting_done = True
@@ -299,8 +325,13 @@ class VobizGeminiLiveSession(VobizCompoundSession):
                 (time.monotonic() - self._ws_connected_at) * 1000, 1
             )
         welcome = self._welcome_text()
-        if not self.greeting_audio_pcm and welcome in _synthesized_greeting_pcm_cache:
-            self.greeting_audio_pcm = _synthesized_greeting_pcm_cache[welcome]
+        cached = cached_greeting_pcm(
+            getattr(self, "agent_id", "") or "",
+            getattr(getattr(self, "agent_config", None), "greeting_audio_hash", "") or "",
+            welcome,
+        )
+        if not self.greeting_audio_pcm and cached:
+            self.greeting_audio_pcm = cached
         if self._ulaw_out_buffer and self._vobiz.stream_id:
             await self._drain_ulaw(force=False)
             self._record_first_audio_out()
@@ -375,8 +406,13 @@ class VobizGeminiLiveSession(VobizCompoundSession):
         welcome = self._welcome_text()
         if not welcome.strip():
             return
-        if not self.greeting_audio_pcm and welcome in _synthesized_greeting_pcm_cache:
-            self.greeting_audio_pcm = _synthesized_greeting_pcm_cache[welcome]
+        cached = cached_greeting_pcm(
+            getattr(self, "agent_id", "") or "",
+            getattr(getattr(self, "agent_config", None), "greeting_audio_hash", "") or "",
+            welcome,
+        )
+        if not self.greeting_audio_pcm and cached:
+            self.greeting_audio_pcm = cached
         self._greeting_started = True
         self.history.append({"role": "assistant", "content": welcome})
         self._barge_in.on_assistant_transcript(welcome)
@@ -537,6 +573,8 @@ class VobizGeminiLiveSession(VobizCompoundSession):
                 save_synthesized_greeting_pcm(
                     self._captured_greeting_key,
                     bytes(self._captured_greeting_pcm),
+                    agent_id=self.agent_id or "",
+                    greeting_hash=getattr(self.agent_config, "greeting_audio_hash", "") or "",
                 )
             self._captured_greeting_pcm.clear()
         if self._out_residual and not self._drop_model_audio_until_next_turn:

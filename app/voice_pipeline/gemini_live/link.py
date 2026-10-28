@@ -18,8 +18,11 @@ import websockets.exceptions
 from app import config
 from app.engine_config import (
     GeminiAuthError,
+    GeminiVoiceError,
+    gemini_voice_or_default,
     get_engine_config,
     is_gemini_auth_failure,
+    is_gemini_voice_rejection,
     mask_secret,
 )
 from app.voice_pipeline.tools import END_CALL_TOOL_NAME, build_gemini_live_tools
@@ -64,6 +67,9 @@ class GeminiLiveLink:
         self._voice = ""
         self._auth_retried = False
         self._auth_failed = False
+        self._voice_retried = False
+        self._voice_rejected = False
+        self._last_close_code: int | None = None
         self._last_close_reason = ""
 
     @property
@@ -174,7 +180,40 @@ class GeminiLiveLink:
             self._model = model
         if voice:
             self._voice = voice
+        default_voice = ""
         try:
+            engine = await get_engine_config()
+            default_voice = engine.gemini_default_voice
+            if not self._api_key:
+                self._api_key = engine.gemini_api_key
+            if not self._model:
+                self._model = engine.gemini_live_model
+        except Exception:
+            default_voice = default_voice or "Aoede"
+        chosen = gemini_voice_or_default(self._voice, default_voice or "Aoede")
+        if chosen != self._voice:
+            logger.warning(
+                "Gemini voice fallback conn=%s requested=%s using=%s",
+                self._connection_id,
+                (self._voice or "")[:8],
+                chosen,
+            )
+        self._voice = chosen
+        try:
+            await self._connect_once(instructions)
+        except GeminiVoiceError:
+            if self._voice_retried or self._closed:
+                raise
+            self._voice_retried = True
+            fallback = gemini_voice_or_default("", default_voice or "Aoede")
+            logger.warning(
+                "Gemini rejected voice conn=%s model=%s; retrying with default %s",
+                self._connection_id,
+                self._model,
+                fallback,
+            )
+            self._voice = fallback
+            await self._reset_socket()
             await self._connect_once(instructions)
         except GeminiAuthError:
             if self._auth_retried or self._closed:
@@ -204,6 +243,8 @@ class GeminiLiveLink:
         self._setup_done.clear()
         self._setup_ok = False
         self._auth_failed = False
+        self._voice_rejected = False
+        self._last_close_code = None
         self._last_close_reason = ""
 
     async def _connect_once(self, instructions: str) -> None:
@@ -221,6 +262,10 @@ class GeminiLiveLink:
                     await asyncio.wait_for(self._setup_done.wait(), timeout=4.0)
                 except asyncio.TimeoutError:
                     pass
+                if self._voice_rejected:
+                    raise GeminiVoiceError(
+                        self._last_close_reason or "Gemini Live rejected the voice"
+                    )
                 if self._auth_failed:
                     raise GeminiAuthError(
                         self._last_close_reason or "Gemini Live rejected the API key"
@@ -231,12 +276,18 @@ class GeminiLiveLink:
                     self._reader = asyncio.create_task(self._read_loop())
                     await self._send_Setup(instructions, disable_thinking=False)
                     await asyncio.wait_for(self._setup_done.wait(), timeout=6.0)
+            except GeminiVoiceError:
+                raise
             except GeminiAuthError:
                 raise
             except Exception as exc:
                 if is_gemini_auth_failure(exc):
                     raise GeminiAuthError("Gemini Live setup rejected the API key") from exc
                 raise
+            if self._voice_rejected:
+                raise GeminiVoiceError(
+                    self._last_close_reason or "Gemini Live rejected the voice"
+                )
             if self._auth_failed:
                 raise GeminiAuthError(
                     self._last_close_reason or "Gemini Live rejected the API key"
@@ -347,8 +398,15 @@ class GeminiLiveLink:
         except asyncio.CancelledError:
             raise
         except websockets.exceptions.ConnectionClosed as exc:
+            self._last_close_code = getattr(exc, "code", None)
+            try:
+                self._last_close_code = int(self._last_close_code) if self._last_close_code is not None else None
+            except (TypeError, ValueError):
+                self._last_close_code = None
             self._last_close_reason = str(getattr(exc, "reason", "") or "")
-            if is_gemini_auth_failure(exc):
+            if is_gemini_voice_rejection(self._last_close_reason, self._last_close_code):
+                self._voice_rejected = True
+            elif is_gemini_auth_failure(exc):
                 self._auth_failed = True
             logger.error(
                 "Gemini Live socket closed conn=%s code=%s reason=%s",

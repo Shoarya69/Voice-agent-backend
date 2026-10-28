@@ -34,6 +34,74 @@ class GeminiAuthError(Exception):
     """Gemini rejected the API key. Safe to retry once after a bootstrap refresh."""
 
 
+class GeminiVoiceError(Exception):
+    """Gemini rejected the requested voice. Retry once with the portal default voice."""
+
+
+# Gemini Live prebuilt voices. Anything else (for example an ElevenLabs voice id)
+# is not sent to Gemini; the portal default voice is used instead.
+_GEMINI_PREBUILT_VOICES = frozenset(
+    {
+        "achernar",
+        "achird",
+        "algenib",
+        "algieba",
+        "alnilam",
+        "aoede",
+        "autonoe",
+        "callirrhoe",
+        "charon",
+        "despina",
+        "enceladus",
+        "erinome",
+        "fenrir",
+        "gacrux",
+        "iapetus",
+        "kore",
+        "laomedeia",
+        "leda",
+        "orus",
+        "puck",
+        "pulcherrima",
+        "rasalgethi",
+        "sadachbia",
+        "sadaltager",
+        "schedar",
+        "sulafat",
+        "umbriel",
+        "vindemiatrix",
+        "zephyr",
+        "zubenelgenubi",
+    }
+)
+
+
+def is_gemini_prebuilt_voice(name: str) -> bool:
+    return (name or "").strip().lower() in _GEMINI_PREBUILT_VOICES
+
+
+def gemini_voice_or_default(requested: str, default_voice: str) -> str:
+    """Use a Gemini prebuilt voice. ElevenLabs ids fall back to the portal default."""
+    fallback = (default_voice or "Aoede").strip() or "Aoede"
+    name = (requested or "").strip()
+    if is_gemini_prebuilt_voice(name):
+        return name
+    if name and name != fallback:
+        logger.info(
+            "Gemini voice %s is not a Live prebuilt voice; using default %s",
+            name[:8],
+            fallback,
+        )
+    return fallback
+
+
+def is_gemini_voice_rejection(reason: str, code: int | None = None) -> bool:
+    text = (reason or "").lower()
+    if "voice" in text and ("not available" in text or "invalid" in text or "api_name" in text):
+        return True
+    return code == 1007 and "voice" in text
+
+
 class EngineConfigError(Exception):
     """Bootstrap did not return a usable Gemini engine config."""
 

@@ -137,8 +137,11 @@ class AgentConfig:
     phone_number_id: str = ""
 
     def gemini_voice_name(self, default_voice: str) -> str:
-        """Portal ``engine.voice``, else legacy voice id, else bootstrap default."""
-        return (self.gemini_voice or self.voice_id or default_voice or "").strip()
+        """Portal ``engine.voice`` when it is a Gemini voice, else the bootstrap default."""
+        from app.engine_config import gemini_voice_or_default
+
+        requested = (self.gemini_voice or self.voice_id or "").strip()
+        return gemini_voice_or_default(requested, default_voice)
 
     def as_overrides(self) -> dict:
         """Fields consumed by app.config's per-call override mechanism."""
@@ -545,7 +548,7 @@ async def _resolve_agent_bundle_impl(
         if known_hash and known_hash in _greeting_pcm_by_hash:
             base.greeting_audio_pcm = _greeting_pcm_by_hash[known_hash]
             base.greeting_audio_hash = known_hash
-        elif not number:
+        else:
             pcm = await get_agent_greeting_pcm(base.token)
             if pcm is not None:
                 base.greeting_audio_pcm = pcm

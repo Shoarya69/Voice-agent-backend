@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from app import call_records, config, engine_config, lovable_client
-from app.engine_config import EngineConfig, GeminiAuthError, mask_secret
+from app.engine_config import EngineConfig, GeminiAuthError, gemini_voice_or_default, mask_secret
 from app.voice_pipeline.factory import get_pipeline_name
 from app.voice_pipeline.gemini_live.link import GeminiLiveLink
 from app.voice_pipeline.tools import gemini_live_system_instructions
@@ -31,6 +31,13 @@ class PortalGeminiEngineTests(unittest.IsolatedAsyncioTestCase):
 
     def tearDown(self) -> None:
         engine_config.reset_engine_config_for_tests()
+
+    def test_elevenlabs_voice_id_falls_back_to_portal_default(self):
+        self.assertEqual(
+            gemini_voice_or_default("90ipbRoKi4CpHXvKVtl0", "Aoede"),
+            "Aoede",
+        )
+        self.assertEqual(gemini_voice_or_default("Puck", "Aoede"), "Puck")
 
     def test_mask_secret_hides_the_middle(self):
         self.assertEqual(mask_secret("AIzaSECRETVALUE99"), "AIza••••UE99")
