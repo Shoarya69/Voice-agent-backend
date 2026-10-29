@@ -158,6 +158,7 @@ class VobizGeminiLiveSession(VobizCompoundSession):
         self._call_error_stage = ""
         self._engine = None
         self._greeting_playback_task: asyncio.Task | None = None
+        self._suppress_spontaneous_model = False
         self._barge_in = GeminiBargeInController()
         self._link = create_realtime_link(
             connection_id,
@@ -216,6 +217,12 @@ class VobizGeminiLiveSession(VobizCompoundSession):
             self.is_speaking = True
             self._last_model_audio_at = time.monotonic()
 
+        if entry.greeting_done and entry.welcome_text:
+            asyncio.create_task(
+                self._link.inject_assistant_greeting_context(entry.welcome_text)
+            )
+            self._suppress_spontaneous_model = True
+
         asyncio.create_task(old_link.close())
         return True
 
@@ -231,6 +238,8 @@ class VobizGeminiLiveSession(VobizCompoundSession):
             self._echo_guard_mono_until = time.monotonic() + 0.45
             self._barge_in.on_assistant_turn_complete()
             self._arm_echo_guard()
+            if self._prewarm_greeting_done:
+                self._suppress_spontaneous_model = True
 
     def _record_first_audio_out(self) -> None:
         if self.first_audio_out_ms is None:
@@ -537,6 +546,15 @@ class VobizGeminiLiveSession(VobizCompoundSession):
     async def _on_model_audio(self, pcm_24k: bytes) -> None:
         if self._closed or not pcm_24k or self._drop_model_audio_until_next_turn:
             return
+        if self._suppress_spontaneous_model and self._user_turns == 0:
+            return
+        if self._is_playing_welcome or (
+            self._greeting_started
+            and self._user_turns == 0
+            and time.monotonic()
+            < (self._playback_active_until_mono + 0.45)
+        ):
+            return
         if not self.is_speaking:
             self._barge_in.on_assistant_speaking_start()
         self.is_speaking = True
@@ -598,6 +616,7 @@ class VobizGeminiLiveSession(VobizCompoundSession):
             self._turn_first_audio_logged = False
             self._drop_model_audio_until_next_turn = False
             self._barge_in_passthrough_until = 0.0
+            self._suppress_spontaneous_model = False
             if user_requested_hangup(text):
                 self._caller_wants_hangup = True
         elif role == "assistant" and self._drop_model_audio_until_next_turn:

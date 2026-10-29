@@ -145,8 +145,10 @@ class LiveKitGeminiLink:
                 "LiveKit engine requires: pip install 'livekit-agents[google]~=1.8'"
             ) from exc
 
-        silence_ms = config.GEMINI_LIVE_SILENCE_MS
-        prefix_ms = config.GEMINI_LIVE_PREFIX_PADDING_MS
+        silence_ms = config.LIVEKIT_GEMINI_SILENCE_MS or config.GEMINI_LIVE_SILENCE_MS
+        prefix_ms = (
+            config.LIVEKIT_GEMINI_PREFIX_PADDING_MS or config.GEMINI_LIVE_PREFIX_PADDING_MS
+        )
         realtime_input_config = types.RealtimeInputConfig(
             automatic_activity_detection=types.AutomaticActivityDetection(
                 silence_duration_ms=silence_ms,
@@ -271,13 +273,29 @@ class LiveKitGeminiLink:
         self._session.generate_reply(instructions=text)
 
     async def inject_assistant_greeting_context(self, greeting_text: str) -> None:
+        """Record played greeting in chat context without triggering new speech."""
         if self._closed or not self.ready or not (greeting_text or "").strip():
             return
-        note = (
-            "[System Note: The customer just answered and heard your greeting: "
-            f"\"{greeting_text.strip()}\". Do NOT repeat it. Respond to what they say next.]"
+        _, llm, _, _ = _livekit_imports()
+        greeting = greeting_text.strip()
+        ctx = self._session.chat_ctx.copy()
+        ctx.add_message(role="assistant", content=greeting)
+        ctx.add_message(
+            role="user",
+            content=(
+                "[The caller already heard that greeting on the phone. "
+                "Wait for them to speak. Do not repeat the greeting or "
+                "ask the next scripted question until they respond.]"
+            ),
         )
-        self._session.generate_reply(instructions=note)
+        try:
+            await self._session.update_chat_ctx(ctx)
+        except Exception as exc:
+            logger.warning(
+                "LiveKit greeting context inject failed conn=%s: %s",
+                self._connection_id,
+                exc,
+            )
 
     async def wait_turn(self, timeout: float) -> None:
         try:
