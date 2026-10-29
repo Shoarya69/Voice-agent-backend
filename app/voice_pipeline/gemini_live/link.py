@@ -156,7 +156,8 @@ class GeminiLiveLink:
                 }
             },
         }
-        if disable_thinking:
+        # Only set thinkingConfig for models that support thinking (e.g. Gemini 3.x / thinking models)
+        if disable_thinking and ("3" in model or "thinking" in model.lower()):
             gen_cfg["thinkingConfig"] = {"thinkingBudget": 0}
 
         setup_msg: dict = {
@@ -172,8 +173,6 @@ class GeminiLiveLink:
                 },
                 "activityHandling": "START_OF_ACTIVITY_INTERRUPTS",
             },
-            "inputAudioTranscription": {},
-            "outputAudioTranscription": {},
             "tools": build_gemini_live_tools(),
         }
 
@@ -354,8 +353,16 @@ class GeminiLiveLink:
                 "clientContent": {
                     "turns": [
                         {
-                            "role": "model",
-                            "parts": [{"text": greeting_text.strip()}],
+                            "role": "user",
+                            "parts": [
+                                {
+                                    "text": (
+                                        "[System Note: The customer just answered the phone and "
+                                        f"heard your greeting: \"{greeting_text.strip()}\". "
+                                        "Do NOT repeat the greeting. Respond naturally to whatever they say next.]"
+                                    )
+                                }
+                            ],
                         }
                     ],
                     "turnComplete": True,
