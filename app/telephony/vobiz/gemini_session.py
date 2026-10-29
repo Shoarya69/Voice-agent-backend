@@ -159,6 +159,8 @@ class VobizGeminiLiveSession(VobizCompoundSession):
         self._engine = None
         self._greeting_playback_task: asyncio.Task | None = None
         self._suppress_spontaneous_model = False
+        self._opening_greeting_already_played = ""
+        self._realtime_connect_after_greeting = False
         self._barge_in = GeminiBargeInController()
         self._link = create_realtime_link(
             connection_id,
@@ -168,6 +170,34 @@ class VobizGeminiLiveSession(VobizCompoundSession):
             on_turn_complete=self._on_turn_complete,
             on_end_call=self._on_end_call_tool,
         )
+
+    def _phone_greeting_in_progress(self, now: float | None = None) -> bool:
+        """True while cached/pre-rendered opening greeting is still on the caller's phone."""
+        if now is None:
+            now = time.monotonic()
+        if (
+            self._greeting_playback_task is not None
+            and not self._greeting_playback_task.done()
+        ):
+            return True
+        if self._is_playing_welcome:
+            return True
+        if (
+            self._greeting_started
+            and self._user_turns == 0
+            and self._prewarm_greeting_done
+            and now < (self._playback_active_until_mono + 0.5)
+        ):
+            return True
+        return False
+
+    def _arm_cached_greeting_playback(self) -> None:
+        """Block LiveKit/Gemini speech until the caller hears the cached opening."""
+        self._suppress_spontaneous_model = True
+        self._is_playing_welcome = True
+        self.is_speaking = True
+        self._last_model_audio_at = time.monotonic()
+        self._barge_in.on_assistant_speaking_start()
 
     async def attach_prepared_session(self, entry: "PreparedGeminiSession") -> bool:
         """Attach a pre-warmed Gemini Live session and pre-rendered greeting."""
@@ -227,6 +257,7 @@ class VobizGeminiLiveSession(VobizCompoundSession):
         return True
 
     async def _finish_prewarm_greeting_playback(self) -> None:
+        welcome = (self._opening_greeting_already_played or self._welcome_text()).strip()
         self._is_playing_welcome = True
         self.is_speaking = True
         self._last_model_audio_at = time.monotonic()
@@ -240,6 +271,9 @@ class VobizGeminiLiveSession(VobizCompoundSession):
             self._arm_echo_guard()
             if self._prewarm_greeting_done:
                 self._suppress_spontaneous_model = True
+            if self._realtime_connect_after_greeting and welcome:
+                self._realtime_connect_after_greeting = False
+                await self._connect_and_inject_greeting_context(welcome)
 
     def _record_first_audio_out(self) -> None:
         if self.first_audio_out_ms is None:
@@ -266,13 +300,21 @@ class VobizGeminiLiveSession(VobizCompoundSession):
         )
 
     async def _connect_and_inject_greeting_context(self, welcome: str) -> None:
-        """Connect Gemini Live in background while cached PCM greeting plays."""
+        """Connect Gemini Live after cached greeting; seed chat context without speaking."""
+        welcome = (welcome or "").strip()
+        if not welcome:
+            return
+        self._suppress_spontaneous_model = True
+        self._opening_greeting_already_played = welcome
+        arm_listen = getattr(self._link, "arm_listen_only_until_caller", None)
+        if callable(arm_listen):
+            arm_listen()
         try:
             await self._ensure_link()
             await self._link.inject_assistant_greeting_context(welcome)
         except Exception as exc:
             logger.warning(
-                "Background Gemini Live connect during cached greeting failed conn=%s: %s",
+                "Gemini Live connect after cached greeting failed conn=%s: %s",
                 self.connection_id,
                 exc,
             )
@@ -298,6 +340,9 @@ class VobizGeminiLiveSession(VobizCompoundSession):
             if self.greeting_audio_pcm and not self._greeting_started:
                 self._greeting_started = True
                 self._prewarm_greeting_done = True
+                self._realtime_connect_after_greeting = True
+                self._opening_greeting_already_played = welcome
+                self._arm_cached_greeting_playback()
                 self.history.append({"role": "assistant", "content": welcome})
                 self._barge_in.on_assistant_transcript(welcome)
                 self._ulaw_out_buffer.extend(
@@ -305,7 +350,6 @@ class VobizGeminiLiveSession(VobizCompoundSession):
                         scale_pcm_volume(self.greeting_audio_pcm, config.TTS_VOLUME)
                     )
                 )
-                asyncio.create_task(self._connect_and_inject_greeting_context(welcome))
                 return
             await self._ensure_link()
             await self._start_greeting_if_needed()
@@ -381,14 +425,17 @@ class VobizGeminiLiveSession(VobizCompoundSession):
         now = time.monotonic()
 
         # Release stuck speaking/welcome flags once playback buffer has finished
-        if not self._ulaw_out_buffer and now >= (self._playback_active_until_mono + 0.25):
+        if (
+            not self._ulaw_out_buffer
+            and now >= (self._playback_active_until_mono + 0.25)
+            and not self._phone_greeting_in_progress(now)
+        ):
             self.is_speaking = False
             self._is_playing_welcome = False
 
         # Opening greeting must finish playing on caller's phone + 400ms echo tail.
-        greeting_on_phone = (
-            self._user_turns == 0
-            and (self._is_playing_welcome or now < (self._playback_active_until_mono + 0.4))
+        greeting_on_phone = self._user_turns == 0 and self._phone_greeting_in_progress(
+            now
         )
         if greeting_on_phone:
             return
@@ -444,19 +491,21 @@ class VobizGeminiLiveSession(VobizCompoundSession):
         self._greeting_started = True
         self.history.append({"role": "assistant", "content": welcome})
         self._barge_in.on_assistant_transcript(welcome)
-        self._barge_in.on_assistant_speaking_start()
-        self._is_playing_welcome = True
-        self.is_speaking = True
-        self._last_model_audio_at = time.monotonic()
         if self.greeting_audio_pcm:
             self._prewarm_greeting_done = True
+            self._realtime_connect_after_greeting = True
+            self._opening_greeting_already_played = welcome
+            self._arm_cached_greeting_playback()
             self._ulaw_out_buffer.extend(
                 pcm_bytes_to_ulaw(
                     scale_pcm_volume(self.greeting_audio_pcm, config.TTS_VOLUME)
                 )
             )
-            asyncio.create_task(self._connect_and_inject_greeting_context(welcome))
             return
+        self._barge_in.on_assistant_speaking_start()
+        self._is_playing_welcome = True
+        self.is_speaking = True
+        self._last_model_audio_at = time.monotonic()
         self._capturing_greeting_pcm = True
         self._captured_greeting_pcm.clear()
         self._captured_greeting_key = welcome
@@ -548,12 +597,7 @@ class VobizGeminiLiveSession(VobizCompoundSession):
             return
         if self._suppress_spontaneous_model and self._user_turns == 0:
             return
-        if self._is_playing_welcome or (
-            self._greeting_started
-            and self._user_turns == 0
-            and time.monotonic()
-            < (self._playback_active_until_mono + 0.45)
-        ):
+        if self._user_turns == 0 and self._phone_greeting_in_progress():
             return
         if not self.is_speaking:
             self._barge_in.on_assistant_speaking_start()
@@ -617,9 +661,25 @@ class VobizGeminiLiveSession(VobizCompoundSession):
             self._drop_model_audio_until_next_turn = False
             self._barge_in_passthrough_until = 0.0
             self._suppress_spontaneous_model = False
+            wake = getattr(self._link, "on_caller_turn_started", None)
+            if callable(wake):
+                try:
+                    await wake()
+                except Exception as exc:
+                    logger.debug(
+                        "Realtime wake on caller turn conn=%s: %s",
+                        self.connection_id,
+                        exc,
+                    )
             if user_requested_hangup(text):
                 self._caller_wants_hangup = True
         elif role == "assistant" and self._drop_model_audio_until_next_turn:
+            return
+        if (
+            role == "assistant"
+            and self._suppress_spontaneous_model
+            and self._user_turns == 0
+        ):
             return
         cleaned = self._strip_call_end_marker(text) if role == "assistant" else text
         if role == "assistant":
@@ -639,6 +699,15 @@ class VobizGeminiLiveSession(VobizCompoundSession):
         await self._vobiz_finish_playback()
 
     async def _on_turn_complete(self) -> None:
+        if self._suppress_spontaneous_model and self._user_turns == 0:
+            return
+        if self._phone_greeting_in_progress():
+            return
+        if (
+            self._greeting_playback_task is not None
+            and not self._greeting_playback_task.done()
+        ):
+            return
         if self._capturing_greeting_pcm:
             self._capturing_greeting_pcm = False
             if (

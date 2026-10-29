@@ -68,6 +68,7 @@ class LiveKitGeminiLink:
         self._model_name = ""
         self._voice = ""
         self._consume_tasks: set[asyncio.Task] = set()
+        self._listen_only_until_user = False
 
     @property
     def ready(self) -> bool:
@@ -231,7 +232,7 @@ class LiveKitGeminiLink:
                 await self._on_turn_complete()
 
     async def _consume_text(self, msg) -> None:
-        if not self._on_transcript:
+        if not self._on_transcript or self._listen_only_until_user:
             return
         try:
             async for text in msg.text_stream:
@@ -245,6 +246,8 @@ class LiveKitGeminiLink:
             logger.debug("LiveKit text stream ended conn=%s: %s", self._connection_id, exc)
 
     async def _consume_audio(self, msg) -> None:
+        if self._listen_only_until_user:
+            return
         try:
             async for frame in msg.audio_stream:
                 pcm = bytes(frame.data)
@@ -272,22 +275,41 @@ class LiveKitGeminiLink:
         self._turn_done.clear()
         self._session.generate_reply(instructions=text)
 
+    def arm_listen_only_until_caller(self) -> None:
+        """Drop model audio/text until the caller's first transcribed turn."""
+        self._listen_only_until_user = True
+
+    async def on_caller_turn_started(self) -> None:
+        """Clear stuck LiveKit generation state so the model can reply to the caller."""
+        self._listen_only_until_user = False
+        if self._closed or not self.ready or self._session is None:
+            return
+        for name in ("interrupt", "clear_audio"):
+            fn = getattr(self._session, name, None)
+            if not callable(fn):
+                continue
+            try:
+                result = fn()
+                if asyncio.iscoroutine(result):
+                    await result
+            except Exception as exc:
+                logger.debug(
+                    "LiveKit %s after caller turn conn=%s: %s",
+                    name,
+                    self._connection_id,
+                    exc,
+                )
+            return
+
     async def inject_assistant_greeting_context(self, greeting_text: str) -> None:
         """Record played greeting in chat context without triggering new speech."""
         if self._closed or not self.ready or not (greeting_text or "").strip():
             return
         _, llm, _, _ = _livekit_imports()
         greeting = greeting_text.strip()
+        self._listen_only_until_user = True
         ctx = self._session.chat_ctx.copy()
         ctx.add_message(role="assistant", content=greeting)
-        ctx.add_message(
-            role="user",
-            content=(
-                "[The caller already heard that greeting on the phone. "
-                "Wait for them to speak. Do not repeat the greeting or "
-                "ask the next scripted question until they respond.]"
-            ),
-        )
         try:
             await self._session.update_chat_ctx(ctx)
         except Exception as exc:

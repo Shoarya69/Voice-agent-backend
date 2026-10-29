@@ -593,6 +593,14 @@ async def connect_session(link: GeminiLiveLink, session) -> None:
         base = openai_brain._messages([])[0]["content"]
         instructions = gemini_live_system_instructions(base)
         voice = engine.gemini_default_voice
+    played = (getattr(session, "_opening_greeting_already_played", "") or "").strip()
+    if played:
+        instructions = (
+            f"{instructions}\n\n"
+            "[CALL STATE: The caller already heard this exact opening greeting on the phone: "
+            f"\"{played}\". Do NOT repeat it or continue pitching until they speak first. "
+            "Stay silent and listen.]"
+        )
     try:
         await link.connect(
             instructions,
