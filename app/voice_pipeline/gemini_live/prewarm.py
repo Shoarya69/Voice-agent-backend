@@ -577,6 +577,32 @@ async def claim_prepared_gemini_session(
             if mapped_id:
                 entry = _by_call_id.pop(mapped_id, None)
 
+        if (
+            entry is None
+            and config.PREWARM_CLAIM_TOKEN_IF_SINGLE
+            and token
+            and token.strip()
+        ):
+            token_key = token.strip()
+            candidates = [
+                e
+                for e in _by_call_id.values()
+                if not e.claimed
+                and e.voicebot_token == token_key
+                and now < e.expires_at
+            ]
+            if len(candidates) == 1:
+                entry = candidates[0]
+                _by_call_id.pop(entry.call_id, None)
+                if _by_token.get(token_key) == entry.call_id:
+                    _by_token.pop(token_key, None)
+                logger.info(
+                    "PREWARM event=claimed_by_token_fallback expected_call_id=%s "
+                    "actual_call_id=%s",
+                    lookup_id or "none",
+                    entry.call_id,
+                )
+
         if entry is not None:
             entry.claimed = True
             if _by_token.get(entry.voicebot_token) == entry.call_id:

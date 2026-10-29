@@ -14,6 +14,7 @@ import json
 import os
 import struct
 import tempfile
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -112,7 +113,7 @@ class GeminiVoiceServerTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(config, "GEMINI_BARGE_IN_ENABLED", True), patch.object(
             ctrl, "is_frame_speech", return_value=True
         ):
-            for _ in range(18):  # 360ms >= 320ms
+            for _ in range(18):  # 360ms >= default GEMINI_BARGE_IN_MIN_SPEECH_MS (200)
                 interrupted, frames = ctrl.process_caller_frame_during_playback(
                     pcm_8k, pcm_16k
                 )
@@ -121,7 +122,7 @@ class GeminiVoiceServerTests(unittest.IsolatedAsyncioTestCase):
                     flushed_frames = frames
                     break
         self.assertTrue(triggered)
-        self.assertGreaterEqual(len(flushed_frames), 13)
+        self.assertGreaterEqual(len(flushed_frames), 10)
 
     def test_05_barge_in_triggers_on_sustained_speech_during_explanation(self):
         ctrl = GeminiBargeInController()
@@ -377,6 +378,31 @@ class GeminiVoiceServerTests(unittest.IsolatedAsyncioTestCase):
         await session._on_model_audio(pcm_24k)
         session._send_paced_frame.assert_awaited()
         await session.close()
+
+    def test_15_opening_mic_release_after_opening_mic_release_ms(self):
+        ws = MagicMock()
+        vobiz = VobizStream(ws)
+        session = VobizGeminiLiveSession("vobiz_mic_release", ws, vobiz)
+        session._prewarm_call_id = "call-mic"
+        session._user_turns = 0
+        session._is_playing_welcome = True
+        session.first_audio_out_ms = 120.0
+        session._ws_connected_at = time.monotonic() - 3.0
+        self.assertTrue(session._phone_greeting_in_progress())
+        self.assertFalse(session._opening_blocks_mic())
+
+    async def test_16_dedupe_repeated_opening_assistant_partial(self):
+        ws = MagicMock()
+        vobiz = VobizStream(ws)
+        session = VobizGeminiLiveSession("vobiz_dedupe", ws, vobiz)
+        session._opening_greeting_already_played = (
+            "Namaste. Kya aap sun rahe hain?"
+        )
+        session._user_turns = 0
+        session.history = []
+        await session._on_transcript("assistant", "Namaste. Kya")
+        self.assertEqual(session.history, [])
+        self.assertTrue(session._is_opening_script_repeat("Namaste. Kya aap"))
 
 
 if __name__ == "__main__":

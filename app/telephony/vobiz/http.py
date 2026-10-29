@@ -10,6 +10,7 @@ from xml.sax.saxutils import escape
 from aiohttp import web
 
 from app import call_records, config, lovable_client
+from app.voice_pipeline.factory import get_pipeline_name
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +56,27 @@ def _wss_url_for_request(
     return base + path
 
 
+async def _schedule_gemini_prewarm_from_answer(body: dict) -> None:
+    try:
+        from app.voice_pipeline.gemini_live.prewarm import (
+            validate_and_schedule_gemini_prewarm,
+        )
+
+        status, payload = await validate_and_schedule_gemini_prewarm(body)
+        logger.info(
+            "PREWARM event=answer_scheduled call_id=%s http_status=%s ok=%s",
+            body.get("call_id"),
+            status,
+            payload.get("ok"),
+        )
+    except Exception as exc:
+        logger.warning(
+            "PREWARM event=answer_schedule_failed call_id=%s error=%s",
+            body.get("call_id"),
+            type(exc).__name__,
+        )
+
+
 async def handle_answer(request: web.Request) -> web.Response:
     """Return Vobiz Stream XML pointing at this server's /ws endpoint."""
     data = dict(request.query)
@@ -96,6 +118,18 @@ async def handle_answer(request: web.Request) -> web.Response:
                     source="vobiz_answer",
                 )
             )
+        if (
+            get_pipeline_name() == "gemini_live"
+            and token
+            and call_id
+        ):
+            prewarm_body = {
+                "voicebot_token": token,
+                "token": token,
+                "call_id": call_id,
+                "direction": "outbound",
+            }
+            asyncio.create_task(_schedule_gemini_prewarm_from_answer(prewarm_body))
 
     try:
         if token:

@@ -598,8 +598,9 @@ async def connect_session(link: GeminiLiveLink, session) -> None:
         instructions = (
             f"{instructions}\n\n"
             "[CALL STATE: The caller already heard this exact opening greeting on the phone: "
-            f"\"{played}\". Do NOT repeat it or continue pitching until they speak first. "
-            "Stay silent and listen.]"
+            f"\"{played}\". Do NOT repeat it, do NOT say Namaste or the first_message script "
+            "again, and do not continue pitching until they speak first. "
+            "Stay silent and listen. Answer their next question directly.]"
         )
     try:
         await link.connect(

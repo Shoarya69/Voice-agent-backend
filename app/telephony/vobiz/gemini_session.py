@@ -163,6 +163,7 @@ class VobizGeminiLiveSession(VobizCompoundSession):
         self._realtime_connect_after_greeting = False
         self._greeting_context_injected = False
         self._opening_greeting_aborted = False
+        self._opening_dead_air_logged = False
         self._barge_in = GeminiBargeInController()
         self._link = create_realtime_link(
             connection_id,
@@ -193,6 +194,40 @@ class VobizGeminiLiveSession(VobizCompoundSession):
             and self._prewarm_greeting_done
             and now < (self._playback_active_until_mono + tail_s)
         ):
+            return True
+        return False
+
+    def _opening_blocks_mic(self, now: float | None = None) -> bool:
+        """True while inbound mic should stay gated during cached opening playback."""
+        if self._opening_greeting_aborted:
+            return False
+        if now is None:
+            now = time.monotonic()
+        if self.first_audio_out_ms is not None:
+            elapsed_ms = (now - self._ws_connected_at) * 1000
+            if elapsed_ms > config.OPENING_MIC_RELEASE_MS:
+                return False
+        return self._user_turns == 0 and self._phone_greeting_in_progress(now)
+
+    def _is_opening_script_repeat(self, text: str) -> bool:
+        if self._user_turns > 1:
+            return False
+        opening = (
+            self._opening_greeting_already_played or self._welcome_text() or ""
+        ).strip()
+        chunk = (text or "").strip()
+        if not opening or not chunk:
+            return False
+        norm_open = opening.lower()
+        norm_chunk = chunk.lower()
+        if norm_chunk == norm_open:
+            return True
+        min_len = min(len(norm_open), len(norm_chunk))
+        if min_len >= 6 and norm_open[:min_len] == norm_chunk[:min_len]:
+            return True
+        if len(norm_chunk) <= len(norm_open) and norm_open.startswith(norm_chunk):
+            return True
+        if len(norm_open) <= len(norm_chunk) and norm_chunk.startswith(norm_open):
             return True
         return False
 
@@ -281,7 +316,8 @@ class VobizGeminiLiveSession(VobizCompoundSession):
         finally:
             self._is_playing_welcome = False
             self.is_speaking = False
-            self._echo_guard_mono_until = time.monotonic() + 0.45
+            echo_tail = 0.25 if self._prewarm_call_id else 0.45
+            self._echo_guard_mono_until = time.monotonic() + echo_tail
             self._barge_in.on_assistant_turn_complete()
             self._arm_echo_guard()
             if self._prewarm_greeting_done and self._user_turns == 0:
@@ -391,13 +427,14 @@ class VobizGeminiLiveSession(VobizCompoundSession):
             logger.warning("Gemini Live prewarm failed conn=%s: %s", self.connection_id, exc)
 
     async def _wait_play_lead(self) -> None:
-        """Keep ~260 ms buffered ahead on Vobiz to prevent mid-word jitter/underruns."""
+        """Keep buffered ahead on Vobiz to prevent mid-word jitter/underruns."""
         if self._play_origin is None:
             return
+        lead_ms = 150 if self._prewarm_call_id else 260
         elapsed_ms = (time.monotonic() - self._play_origin) * 1000
         ahead_ms = self._play_sent_ms - elapsed_ms
-        if ahead_ms > 260:
-            await asyncio.sleep((ahead_ms - 260) / 1000)
+        if ahead_ms > lead_ms:
+            await asyncio.sleep((ahead_ms - lead_ms) / 1000)
 
     async def _drain_ulaw(self, *, force: bool) -> None:
         while self._ulaw_out_buffer and not self._vobiz.closed:
@@ -469,8 +506,7 @@ class VobizGeminiLiveSession(VobizCompoundSession):
 
         # Opening greeting must finish playing on caller's phone + 400ms echo tail.
         greeting_on_phone = (
-            self._user_turns == 0
-            and self._phone_greeting_in_progress(now)
+            self._opening_blocks_mic(now)
             and now >= self._barge_in_passthrough_until
         )
         if greeting_on_phone:
@@ -662,11 +698,29 @@ class VobizGeminiLiveSession(VobizCompoundSession):
         self._last_model_audio_at = time.monotonic()
         if not self._turn_first_audio_logged and self._last_user_transcript_at > 0:
             self._turn_first_audio_logged = True
+            response_start_ms = (
+                time.monotonic() - self._last_user_transcript_at
+            ) * 1000
             logger.info(
                 "LATENCY_GEMINI_TURN session_id=%s response_start_ms=%.0f",
                 self.connection_id,
-                (time.monotonic() - self._last_user_transcript_at) * 1000,
+                response_start_ms,
             )
+            if not self._opening_dead_air_logged:
+                self._opening_dead_air_logged = True
+                first_user_ms = round(
+                    (self._last_user_transcript_at - self._ws_connected_at) * 1000,
+                    1,
+                )
+                logger.info(
+                    "CALL_METRICS event=opening_dead_air session_id=%s "
+                    "first_audio_out_ms=%s first_user_transcript_ms=%.1f "
+                    "first_assistant_after_user_ms=%.0f",
+                    self.connection_id,
+                    self.first_audio_out_ms,
+                    first_user_ms,
+                    response_start_ms,
+                )
         pcm_8k, self._out_state = resample_24k_to_8k_clean(
             pcm_24k, self._out_state
         )
@@ -740,6 +794,13 @@ class VobizGeminiLiveSession(VobizCompoundSession):
             and self._suppress_spontaneous_model
             and self._phone_greeting_in_progress()
         ):
+            return
+        if role == "assistant" and self._is_opening_script_repeat(text):
+            logger.debug(
+                "Dropping duplicate opening assistant partial conn=%s text=%s",
+                self.connection_id,
+                (text or "")[:80],
+            )
             return
         cleaned = self._strip_call_end_marker(text) if role == "assistant" else text
         if role == "assistant":
