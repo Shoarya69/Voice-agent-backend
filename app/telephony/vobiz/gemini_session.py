@@ -162,6 +162,7 @@ class VobizGeminiLiveSession(VobizCompoundSession):
         self._opening_greeting_already_played = ""
         self._realtime_connect_after_greeting = False
         self._greeting_context_injected = False
+        self._opening_greeting_aborted = False
         self._barge_in = GeminiBargeInController()
         self._link = create_realtime_link(
             connection_id,
@@ -174,6 +175,8 @@ class VobizGeminiLiveSession(VobizCompoundSession):
 
     def _phone_greeting_in_progress(self, now: float | None = None) -> bool:
         """True while cached/pre-rendered opening greeting is still on the caller's phone."""
+        if self._opening_greeting_aborted:
+            return False
         if now is None:
             now = time.monotonic()
         if (
@@ -252,11 +255,14 @@ class VobizGeminiLiveSession(VobizCompoundSession):
 
         if entry.welcome_text:
             self._opening_greeting_already_played = entry.welcome_text.strip()
+        if entry.greeting_done and entry.welcome_text:
+            self._barge_in.on_assistant_transcript(entry.welcome_text.strip())
         if entry.greeting_done:
             self._suppress_spontaneous_model = True
-            arm = getattr(self._link, "arm_listen_only_until_caller", None)
-            if callable(arm):
-                arm()
+            if not entry.greeting_context_injected:
+                arm = getattr(self._link, "arm_listen_only_until_caller", None)
+                if callable(arm):
+                    arm()
             if entry.welcome_text and not entry.greeting_context_injected:
                 asyncio.create_task(
                     self._link.inject_assistant_greeting_context(entry.welcome_text)
@@ -462,8 +468,10 @@ class VobizGeminiLiveSession(VobizCompoundSession):
             self._is_playing_welcome = False
 
         # Opening greeting must finish playing on caller's phone + 400ms echo tail.
-        greeting_on_phone = self._user_turns == 0 and self._phone_greeting_in_progress(
-            now
+        greeting_on_phone = (
+            self._user_turns == 0
+            and self._phone_greeting_in_progress(now)
+            and now >= self._barge_in_passthrough_until
         )
         if greeting_on_phone:
             should_interrupt, frames_to_send = (
@@ -563,6 +571,8 @@ class VobizGeminiLiveSession(VobizCompoundSession):
 
     async def speak_welcome(self) -> None:
         if self._greeting_started and self._ulaw_out_buffer and self._vobiz.stream_id:
+            if self._prewarm_greeting_done:
+                self._barge_in.on_assistant_speaking_start()
             await self._drain_ulaw(force=False)
             self._record_first_audio_out()
             if self._prewarm_greeting_done:
@@ -642,7 +652,7 @@ class VobizGeminiLiveSession(VobizCompoundSession):
     async def _on_model_audio(self, pcm_24k: bytes) -> None:
         if self._closed or not pcm_24k or self._drop_model_audio_until_next_turn:
             return
-        if self._suppress_spontaneous_model and self._user_turns == 0:
+        if self._suppress_spontaneous_model and self._phone_greeting_in_progress():
             return
         if self._user_turns == 0 and self._phone_greeting_in_progress():
             return
@@ -728,7 +738,7 @@ class VobizGeminiLiveSession(VobizCompoundSession):
         if (
             role == "assistant"
             and self._suppress_spontaneous_model
-            and self._user_turns == 0
+            and self._phone_greeting_in_progress()
         ):
             return
         cleaned = self._strip_call_end_marker(text) if role == "assistant" else text
@@ -806,7 +816,14 @@ class VobizGeminiLiveSession(VobizCompoundSession):
             and not self._greeting_playback_task.done()
         ):
             self._greeting_playback_task.cancel()
-        self._drop_model_audio_until_next_turn = True
+        opening_cached = bool(
+            self._prewarm_call_id or self._prewarm_greeting_done
+        )
+        if opening_cached:
+            self._opening_greeting_aborted = True
+            self._drop_model_audio_until_next_turn = False
+        else:
+            self._drop_model_audio_until_next_turn = True
         self._capturing_greeting_pcm = False
         self._captured_greeting_pcm.clear()
         self._barge_in.mark_interrupted()
@@ -822,4 +839,10 @@ class VobizGeminiLiveSession(VobizCompoundSession):
         release = getattr(self._link, "release_listen_only", None)
         if callable(release):
             release()
+        if opening_cached:
+            logger.info(
+                "OPENING event=barge_in conn=%s prewarm_call_id=%s listen_only_released=true",
+                self.connection_id,
+                self._prewarm_call_id or "none",
+            )
         await self._send_clear()

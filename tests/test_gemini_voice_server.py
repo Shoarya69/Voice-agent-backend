@@ -354,6 +354,30 @@ class GeminiVoiceServerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("opening greeting", sent)
         await session.close()
 
+    async def test_14_opening_barge_allows_model_reply_before_transcript(self):
+        ws = MagicMock()
+        vobiz = VobizStream(ws)
+        vobiz.stream_id = "stream-barge"
+        session = VobizGeminiLiveSession("vobiz_barge", ws, vobiz)
+        session._prewarm_call_id = "call-barge"
+        session._prewarm_greeting_done = True
+        session._greeting_started = True
+        session._suppress_spontaneous_model = True
+        session._user_turns = 0
+        session._send_clear = AsyncMock()
+        session._send_paced_frame = AsyncMock(return_value=True)
+
+        await session._on_interrupt(local_barge_in=True)
+
+        self.assertTrue(session._opening_greeting_aborted)
+        self.assertFalse(session._drop_model_audio_until_next_turn)
+        self.assertFalse(session._phone_greeting_in_progress())
+
+        pcm_24k = b"\x01\x00" * 2400
+        await session._on_model_audio(pcm_24k)
+        session._send_paced_frame.assert_awaited()
+        await session.close()
+
 
 if __name__ == "__main__":
     unittest.main()
