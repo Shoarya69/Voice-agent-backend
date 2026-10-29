@@ -29,6 +29,17 @@ from app.voice_pipeline.tools import END_CALL_TOOL_NAME, build_gemini_live_tools
 
 logger = logging.getLogger(__name__)
 
+
+def gemini_speak_message(instruction: str) -> dict:
+    """Ask a native-audio Live model to speak.
+
+    ``clientContent`` is stored as conversation context on
+    gemini-2.5-flash-native-audio and the turn completes with no audio.
+    ``realtimeInput.text`` is a complete user turn and is what produces speech.
+    """
+    return {"realtimeInput": {"text": instruction}}
+
+
 AudioHandler = Callable[[bytes], Awaitable[None]]
 TextHandler = Callable[[str, str], Awaitable[None]]
 InterruptHandler = Callable[[], Awaitable[None]]
@@ -71,6 +82,8 @@ class GeminiLiveLink:
         self._voice_rejected = False
         self._last_close_code: int | None = None
         self._last_close_reason = ""
+        self._expect_speech = False
+        self._audio_chunks_this_turn = 0
 
     @property
     def ready(self) -> bool:
@@ -143,8 +156,7 @@ class GeminiLiveLink:
                 }
             },
         }
-        # Only set thinkingConfig for models that support thinking (e.g. Gemini 3.x / thinking models)
-        if disable_thinking and ("3" in model or "thinking" in model.lower()):
+        if disable_thinking:
             gen_cfg["thinkingConfig"] = {"thinkingBudget": 0}
 
         setup_msg: dict = {
@@ -160,6 +172,8 @@ class GeminiLiveLink:
                 },
                 "activityHandling": "START_OF_ACTIVITY_INTERRUPTS",
             },
+            "inputAudioTranscription": {},
+            "outputAudioTranscription": {},
             "tools": build_gemini_live_tools(),
         }
 
@@ -320,23 +334,16 @@ class GeminiLiveLink:
         )
 
     async def say(self, instruction: str) -> None:
-        """Ask the model to speak. Used for the greeting."""
+        """Ask the model to speak. Used for the greeting and live replies."""
         if self._closed or not self.ready:
             return
+        text = (instruction or "").strip()
+        if not text:
+            return
         self._turn_done.clear()
-        await self._send(
-            {
-                "clientContent": {
-                    "turns": [
-                        {
-                            "role": "user",
-                            "parts": [{"text": instruction}],
-                        }
-                    ],
-                    "turnComplete": True,
-                }
-            }
-        )
+        self._expect_speech = True
+        self._audio_chunks_this_turn = 0
+        await self._send(gemini_speak_message(text))
 
     async def inject_assistant_greeting_context(self, greeting_text: str) -> None:
         """Record an already-played cached PCM greeting into Gemini Live context without speaking."""
@@ -351,7 +358,7 @@ class GeminiLiveLink:
                             "parts": [{"text": greeting_text.strip()}],
                         }
                     ],
-                    "turnComplete": False,
+                    "turnComplete": True,
                 }
             }
         )
@@ -461,9 +468,19 @@ class GeminiLiveLink:
             if fn:
                 await self._handle_function_call(fn)
                 continue
+            if part.get("thought"):
+                continue
             text_part = (part.get("text") or "").strip()
-            if text_part and self._on_transcript is not None:
-                await self._on_transcript("assistant", text_part)
+            if text_part:
+                if (
+                    text_part.startswith("**")
+                    or text_part.startswith("Crafting")
+                    or "registered the user" in text_part
+                    or "formulate" in text_part
+                ):
+                    continue
+                if self._on_transcript is not None:
+                    await self._on_transcript("assistant", text_part)
             inline = part.get("inlineData") or part.get("inline_data") or {}
             data = inline.get("data")
             if not data:
@@ -471,9 +488,29 @@ class GeminiLiveLink:
             mime = (inline.get("mimeType") or inline.get("mime_type") or "").lower()
             if mime and "audio" not in mime:
                 continue
-            await self._on_audio(base64.b64decode(data))
+            try:
+                pcm = base64.b64decode(data)
+            except Exception:
+                logger.warning(
+                    "Gemini Live audio decode failed conn=%s",
+                    self._connection_id,
+                )
+                continue
+            if not pcm:
+                continue
+            self._audio_chunks_this_turn += 1
+            self._expect_speech = False
+            await self._on_audio(pcm)
 
         if content.get("turnComplete") or content.get("generationComplete"):
+            if self._expect_speech and self._audio_chunks_this_turn == 0:
+                logger.warning(
+                    "Gemini Live turn had no audio conn=%s content_keys=%s",
+                    self._connection_id,
+                    ",".join(sorted(str(k) for k in content.keys())),
+                )
+                self._expect_speech = False
+            self._audio_chunks_this_turn = 0
             self._turn_done.set()
             if self._on_turn_complete is not None:
                 await self._on_turn_complete()

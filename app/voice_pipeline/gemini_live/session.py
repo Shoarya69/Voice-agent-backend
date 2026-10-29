@@ -161,6 +161,10 @@ class GeminiLivePipelineSession(VoicePipelineSession):
                 self._barge_in.on_assistant_transcript(welcome)
             asyncio.create_task(self._connect_and_inject_greeting_context(welcome))
 
+        if self._greeting_started and self._prewarm_greeting_done and not self._prewarm_pcm_frames:
+            self._greeting_started = False
+            self._prewarm_greeting_done = False
+
         if self._greeting_started:
             if self._prewarm_pcm_frames:
                 frames = list(self._prewarm_pcm_frames)

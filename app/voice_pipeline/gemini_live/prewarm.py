@@ -224,6 +224,20 @@ async def _warm_prepared_session(
         instructions = build_gemini_instructions_for_agent(entry.agent_config)
 
         cached_pcm = entry.agent_config.greeting_audio_pcm
+        if not cached_pcm:
+            from app.telephony.vobiz.gemini_session import cached_greeting_pcm
+
+            cached_pcm = cached_greeting_pcm(
+                entry.agent_config.agent_id or "",
+                entry.agent_config.greeting_audio_hash or "",
+                entry.welcome_text,
+            )
+            if cached_pcm:
+                logger.info(
+                    "PREWARM event=greeting_disk_cache call_id=%s bytes=%s",
+                    entry.call_id,
+                    len(cached_pcm),
+                )
         if cached_pcm:
             entry.pcm_8k_frames = chunk_pcm(cached_pcm)
             entry.ulaw_greeting.extend(
@@ -262,17 +276,27 @@ async def _warm_prepared_session(
             if role == "assistant" and text:
                 entry.transcript_parts.append(text)
 
-        async def _on_turn_complete() -> None:
-            if entry.out_residual and not entry.claimed:
-                chunk = bytes(entry.out_residual)
-                entry.out_residual.clear()
-                entry.pcm_8k_frames.append(chunk)
-                entry.ulaw_greeting.extend(
-                    pcm_bytes_to_ulaw(scale_pcm_volume(chunk, config.TTS_VOLUME))
-                )
+        empty_watch: asyncio.Task | None = None
+
+        def _mark_greeting_ready() -> None:
+            if entry.greeting_done:
+                return
             entry.greeting_done = True
+            entry.greeting_started = True
             entry.greeting_total_ms = round((time.monotonic() - started) * 1000, 1)
             entry.first_audio_event.set()
+            pcm = b"".join(entry.pcm_8k_frames)
+            if entry.agent_config is not None and len(pcm) >= 3200:
+                from app.telephony.vobiz.gemini_session import (
+                    save_synthesized_greeting_pcm,
+                )
+
+                save_synthesized_greeting_pcm(
+                    entry.welcome_text,
+                    pcm,
+                    agent_id=entry.agent_config.agent_id or "",
+                    greeting_hash=entry.agent_config.greeting_audio_hash or "",
+                )
             logger.info(
                 "PREWARM event=greeting_ready call_id=%s bundle_ms=%s "
                 "gemini_setup_ms=%s greeting_first_byte_ms=%s greeting_total_ms=%s "
@@ -284,6 +308,37 @@ async def _warm_prepared_session(
                 entry.greeting_total_ms,
                 len(entry.ulaw_greeting),
             )
+
+        async def _mark_empty_if_still_silent() -> None:
+            await asyncio.sleep(0.45)
+            if entry.closed or entry.greeting_done:
+                return
+            if entry.ulaw_greeting:
+                _mark_greeting_ready()
+                return
+            # Native-audio models complete a context-only turn with no audio.
+            # Leave the greeting unfinished so the live call speaks it.
+            entry.greeting_started = False
+            entry.first_audio_event.set()
+            logger.warning(
+                "PREWARM event=greeting_empty call_id=%s ulaw_bytes=0",
+                entry.call_id,
+            )
+
+        async def _on_turn_complete() -> None:
+            nonlocal empty_watch
+            if entry.out_residual and not entry.claimed:
+                chunk = bytes(entry.out_residual)
+                entry.out_residual.clear()
+                entry.pcm_8k_frames.append(chunk)
+                entry.ulaw_greeting.extend(
+                    pcm_bytes_to_ulaw(scale_pcm_volume(chunk, config.TTS_VOLUME))
+                )
+            if entry.ulaw_greeting:
+                _mark_greeting_ready()
+                return
+            if empty_watch is None or empty_watch.done():
+                empty_watch = asyncio.create_task(_mark_empty_if_still_silent())
 
         link = GeminiLiveLink(
             f"prewarm_{entry.call_id[:12]}",

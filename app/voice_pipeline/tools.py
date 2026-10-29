@@ -60,7 +60,9 @@ def gemini_live_system_instructions(
     return (
         f"{system_prompt}\n\n"
         "--- GEMINI LIVE PHONE RULES ---\n"
-        "Speak like a person on a live phone call, warm and clear. "
+        "Speak like a person on a live phone call, warm, natural, and concise. "
+        "CRITICAL: Never output internal reasoning, preambles, or text thoughts like 'Crafting A Response'. "
+        "Respond immediately with direct spoken voice in real-time.\n"
         f"{language_rule}{closing_rule} "
         "Ignore automated carrier announcements such as 'this call is now being recorded'. "
         "Ask only one short question at a time and wait for the caller to reply.\n"

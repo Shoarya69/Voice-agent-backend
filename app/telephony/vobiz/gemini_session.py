@@ -259,11 +259,7 @@ class VobizGeminiLiveSession(VobizCompoundSession):
         """Connect Gemini Live in background while cached PCM greeting plays."""
         try:
             await self._ensure_link()
-            await self._link.inject_assistant_greeting_context(
-                f"{welcome}\n"
-                "The caller already heard this greeting on the phone. "
-                "Do not say it again. If they only say hello, ask one short question."
-            )
+            await self._link.inject_assistant_greeting_context(welcome)
         except Exception as exc:
             logger.warning(
                 "Background Gemini Live connect during cached greeting failed conn=%s: %s",
@@ -466,10 +462,41 @@ class VobizGeminiLiveSession(VobizCompoundSession):
         )
 
     async def speak_welcome(self) -> None:
-        if not self._greeting_started and self.greeting_audio_pcm:
-            await self._start_greeting_if_needed()
+        if self._greeting_started and self._ulaw_out_buffer and self._vobiz.stream_id:
+            await self._drain_ulaw(force=False)
+            self._record_first_audio_out()
+            if self._prewarm_greeting_done:
+                self._greeting_playback_task = asyncio.create_task(
+                    self._finish_prewarm_greeting_playback()
+                )
+            return
 
-        if self._greeting_started:
+        # Prewarm connected but the model returned no audio. Speak on this call.
+        if self._greeting_started and not self._ulaw_out_buffer:
+            if not self._prewarm_greeting_done:
+                for _ in range(8):
+                    if self._ulaw_out_buffer or self.is_speaking:
+                        break
+                    await asyncio.sleep(0.25)
+            if self._ulaw_out_buffer and self._vobiz.stream_id:
+                await self._drain_ulaw(force=False)
+                self._record_first_audio_out()
+                return
+            if self.is_speaking:
+                return
+            logger.warning(
+                "Prewarm greeting was empty conn=%s; speaking on the live call",
+                self.connection_id,
+            )
+            self._greeting_started = False
+            self._prewarm_greeting_done = False
+
+        if self._greeting_started and not self._prewarm_greeting_done:
+            return
+
+        try:
+            await self._ensure_link()
+            await self._start_greeting_if_needed()
             if self._ulaw_out_buffer and self._vobiz.stream_id:
                 await self._drain_ulaw(force=False)
                 self._record_first_audio_out()
@@ -477,10 +504,6 @@ class VobizGeminiLiveSession(VobizCompoundSession):
                     self._greeting_playback_task = asyncio.create_task(
                         self._finish_prewarm_greeting_playback()
                     )
-            return
-        try:
-            await self._ensure_link()
-            await self._start_greeting_if_needed()
         except Exception as exc:
             logger.error(
                 "Gemini Live connect failed conn=%s: %s",
