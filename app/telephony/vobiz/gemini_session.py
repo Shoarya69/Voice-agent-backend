@@ -798,7 +798,8 @@ class VobizGeminiLiveSession(VobizCompoundSession):
         self._schedule_close_after_playback_if_needed()
 
     async def _on_interrupt(self, local_barge_in: bool = False) -> None:
-        if not local_barge_in and self._phone_greeting_in_progress():
+        # Only our phone-line barge-in may flush playback; LiveKit VAD must not.
+        if not local_barge_in:
             return
         if (
             self._greeting_playback_task is not None
@@ -817,4 +818,8 @@ class VobizGeminiLiveSession(VobizCompoundSession):
         self._playback_active_until_mono = 0.0
         self._is_playing_welcome = False
         self.is_speaking = False
+        self._suppress_spontaneous_model = False
+        release = getattr(self._link, "release_listen_only", None)
+        if callable(release):
+            release()
         await self._send_clear()

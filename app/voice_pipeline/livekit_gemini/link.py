@@ -252,8 +252,6 @@ class LiveKitGeminiLink:
     def _on_input_speech_started(self, _ev) -> None:
         # Unblock model output as soon as caller speech is detected (before transcript).
         self._listen_only_until_user = False
-        if self._on_interrupt is not None:
-            asyncio.create_task(self._on_interrupt())
 
     def _on_session_error(self, err) -> None:
         logger.error(
@@ -341,26 +339,8 @@ class LiveKitGeminiLink:
         self._listen_only_until_user = False
 
     async def on_caller_turn_started(self) -> None:
-        """Clear stuck LiveKit generation state so the model can reply to the caller."""
+        """Caller spoke — allow model audio (opening listen-only is done)."""
         self._listen_only_until_user = False
-        if self._closed or not self.ready or self._session is None:
-            return
-        for name in ("interrupt", "clear_audio"):
-            fn = getattr(self._session, name, None)
-            if not callable(fn):
-                continue
-            try:
-                result = fn()
-                if asyncio.iscoroutine(result):
-                    await result
-            except Exception as exc:
-                logger.debug(
-                    "LiveKit %s after caller turn conn=%s: %s",
-                    name,
-                    self._connection_id,
-                    exc,
-                )
-            return
 
     async def inject_assistant_greeting_context(self, greeting_text: str) -> None:
         """Record played greeting in chat context without triggering new speech."""

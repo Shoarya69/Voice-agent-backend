@@ -207,7 +207,16 @@ async def handle_vobiz_websocket(websocket) -> None:
                     attached = await session.attach_prepared_session(prepared)
                     if attached:
                         voice_server._commit_agent_config_to_session(session)
+                        session.call_direction = prepared.direction or "outbound"
                         return True
+                if ws_call_id or session.lovable_token:
+                    logger.info(
+                        "PREWARM event=miss conn=%s call_id=%s token=%s "
+                        "(schedule /prewarm with same call_id before dial)",
+                        connection_id,
+                        (ws_call_id or "")[:36],
+                        (session.lovable_token or "")[:8] + "..." if session.lovable_token else "",
+                    )
 
             start_agent_prefetch(session, connection_id)
             preconnect = getattr(session, "preconnect_socket", None)
