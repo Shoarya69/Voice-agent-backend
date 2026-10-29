@@ -115,9 +115,11 @@ class GeminiLiveLink:
 
     async def _connect_ws(self, api_key: str):
         url = f"{config.GEMINI_LIVE_WS_URL}?key={api_key}"
+        headers = {"x-goog-api-key": api_key}
         try:
             return await websockets.connect(
                 url,
+                additional_headers=headers,
                 ping_interval=20,
                 ping_timeout=10,
                 max_size=16 * 1024 * 1024,
@@ -141,30 +143,27 @@ class GeminiLiveLink:
                 }
             },
         }
-        if disable_thinking:
+        # Only set thinkingConfig for models that support thinking (e.g. Gemini 3.x / thinking models)
+        if disable_thinking and ("3" in model or "thinking" in model.lower()):
             gen_cfg["thinkingConfig"] = {"thinkingBudget": 0}
 
-        await self._send(
-            {
-                "setup": {
-                    "model": f"models/{model}",
-                    "generationConfig": gen_cfg,
-                    "systemInstruction": {
-                        "parts": [{"text": instructions}],
-                    },
-                    "inputAudioTranscription": {},
-                    "outputAudioTranscription": {},
-                    "realtimeInputConfig": {
-                        "automaticActivityDetection": {
-                            "silenceDurationMs": config.GEMINI_LIVE_SILENCE_MS,
-                            "prefixPaddingMs": config.GEMINI_LIVE_PREFIX_PADDING_MS,
-                        },
-                        "activityHandling": "START_OF_ACTIVITY_INTERRUPTS",
-                    },
-                    "tools": build_gemini_live_tools(),
-                }
-            }
-        )
+        setup_msg: dict = {
+            "model": f"models/{model}",
+            "generationConfig": gen_cfg,
+            "systemInstruction": {
+                "parts": [{"text": instructions}],
+            },
+            "realtimeInputConfig": {
+                "automaticActivityDetection": {
+                    "silenceDurationMs": config.GEMINI_LIVE_SILENCE_MS,
+                    "prefixPaddingMs": config.GEMINI_LIVE_PREFIX_PADDING_MS,
+                },
+                "activityHandling": "START_OF_ACTIVITY_INTERRUPTS",
+            },
+            "tools": build_gemini_live_tools(),
+        }
+
+        await self._send({"setup": setup_msg})
 
     async def connect(
         self,

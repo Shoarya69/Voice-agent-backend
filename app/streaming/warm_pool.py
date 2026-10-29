@@ -209,9 +209,11 @@ async def _open_gemini_socket():
         return None
     note_pooled_gemini_key(engine.gemini_api_key)
     url = f"{config.GEMINI_LIVE_WS_URL}?key={engine.gemini_api_key}"
+    headers = {"x-goog-api-key": engine.gemini_api_key}
     try:
         return await websockets.connect(
             url,
+            additional_headers=headers,
             ping_interval=20,
             ping_timeout=10,
             max_size=16 * 1024 * 1024,

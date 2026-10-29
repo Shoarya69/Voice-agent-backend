@@ -151,7 +151,7 @@ def is_gemini_auth_failure(exc: BaseException) -> bool:
         code_int = int(code) if code is not None else None
     except (TypeError, ValueError):
         code_int = None
-    if code_int in (401, 403, 1008):
+    if code_int in (401, 403):
         return True
     text = f"{type(exc).__name__} {exc}".lower()
     return any(
