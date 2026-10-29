@@ -369,11 +369,16 @@ class VobizGeminiLiveSession(VobizCompoundSession):
         )
 
         now = time.monotonic()
-        # Opening greeting must finish. Phone echo during it is not the caller.
-        greeting_on_phone = self._is_playing_welcome or (
-            self._greeting_started
-            and self._user_turns == 0
-            and now < (self._playback_active_until_mono + 0.7)
+
+        # Release stuck speaking/welcome flags once playback buffer has finished
+        if not self._ulaw_out_buffer and now >= (self._playback_active_until_mono + 0.25):
+            self.is_speaking = False
+            self._is_playing_welcome = False
+
+        # Opening greeting must finish playing on caller's phone + 400ms echo tail.
+        greeting_on_phone = (
+            self._user_turns == 0
+            and (self._is_playing_welcome or now < (self._playback_active_until_mono + 0.4))
         )
         if greeting_on_phone:
             return
@@ -390,36 +395,25 @@ class VobizGeminiLiveSession(VobizCompoundSession):
             or now < (self._playback_active_until_mono + 0.25)
         )
         if phone_still_playing:
-            # Release stuck speaking flags once Vobiz playback + 250ms echo tail has elapsed
-            if (
-                not self._ulaw_out_buffer
-                and now >= (self._playback_active_until_mono + 0.25)
-                and self._last_model_audio_at > 0
-                and (now - self._last_model_audio_at) > 0.4
-            ):
-                self.is_speaking = False
-                self._is_playing_welcome = False
-                self._barge_in.on_assistant_turn_complete()
-            else:
-                # While agent audio is playing on the phone, block phone-line echo from
-                # reaching Gemini (prevents "de la" / "bien" self-interruption), BUT
-                # allow real caller speech (high RMS) to barge in and silence the agent!
-                should_interrupt, frames_to_send = (
-                    self._barge_in.process_caller_frame_during_playback(
-                        pcm_8k, pcm_16k
-                    )
+            # While agent audio is playing on the phone, block phone-line echo from
+            # reaching Gemini (prevents self-interruption), BUT
+            # allow real caller speech (high RMS) to barge in and silence the agent!
+            should_interrupt, frames_to_send = (
+                self._barge_in.process_caller_frame_during_playback(
+                    pcm_8k, pcm_16k
                 )
-                if should_interrupt:
-                    logger.info(
-                        "🛑 Caller barge-in detected conn=%s speech_ms=%.0f",
-                        self.connection_id,
-                        self._barge_in.speech_ms,
-                    )
-                    self._barge_in_passthrough_until = now + 3.5
-                    await self._on_interrupt(local_barge_in=True)
-                    for chunk_16k in frames_to_send:
-                        await self._link.send_pcm16k(chunk_16k)
-                return
+            )
+            if should_interrupt:
+                logger.info(
+                    "🛑 Caller barge-in detected conn=%s speech_ms=%.0f",
+                    self.connection_id,
+                    self._barge_in.speech_ms,
+                )
+                self._barge_in_passthrough_until = now + 3.5
+                await self._on_interrupt(local_barge_in=True)
+                for chunk_16k in frames_to_send:
+                    await self._link.send_pcm16k(chunk_16k)
+            return
 
         self._drop_model_audio_until_next_turn = False
         await self._link.send_pcm16k(pcm_16k)
