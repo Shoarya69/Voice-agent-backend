@@ -264,6 +264,10 @@ async def _drain_livekit_pool() -> None:
             pass
 
 
+async def _pool_livekit_noop_audio(_pcm: bytes) -> None:
+    return None
+
+
 async def _create_pooled_livekit(slot: int):
     from app.engine_config import get_engine_config
     from app.voice_pipeline.livekit_gemini.link import LiveKitGeminiLink
@@ -271,7 +275,10 @@ async def _create_pooled_livekit(slot: int):
     engine = await get_engine_config()
     if not engine.gemini_api_key:
         return None
-    link = LiveKitGeminiLink(f"_livekit_pool_{slot}")
+    link = LiveKitGeminiLink(
+        f"_livekit_pool_{slot}",
+        on_audio=_pool_livekit_noop_audio,
+    )
     try:
         await link.connect(
             "[Transport pool] Warm LiveKit Google Realtime session. "
