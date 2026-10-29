@@ -24,6 +24,7 @@ _maintain_task: asyncio.Task | None = None
 _tts_pool: asyncio.Queue[ElevenLabsWebSocketTTSProvider] = asyncio.Queue()
 _stt_pool: asyncio.Queue[ElevenLabsStreamingSTTProvider] = asyncio.Queue()
 _gemini_ws_pool: asyncio.Queue = asyncio.Queue()
+_livekit_pool: asyncio.Queue = asyncio.Queue()
 _pool_lock = asyncio.Lock()
 
 
@@ -245,6 +246,93 @@ async def refill_gemini_pool_for_new_key() -> None:
     async with _pool_lock:
         await _drain_gemini_pool()
     await _fill_gemini_pool()
+    if get_realtime_engine_name() == "livekit":
+        async with _pool_lock:
+            await _drain_livekit_pool()
+        await _fill_livekit_pool()
+
+
+async def _drain_livekit_pool() -> None:
+    while not _livekit_pool.empty():
+        try:
+            link = _livekit_pool.get_nowait()
+        except asyncio.QueueEmpty:
+            break
+        try:
+            await link.close()
+        except Exception:
+            pass
+
+
+async def _create_pooled_livekit(slot: int):
+    from app.engine_config import get_engine_config
+    from app.voice_pipeline.livekit_gemini.link import LiveKitGeminiLink
+
+    engine = await get_engine_config()
+    if not engine.gemini_api_key:
+        return None
+    link = LiveKitGeminiLink(f"_livekit_pool_{slot}")
+    try:
+        await link.connect(
+            "[Transport pool] Warm LiveKit Google Realtime session. "
+            "Call-specific instructions are applied on borrow.",
+            api_key=engine.gemini_api_key,
+            model=engine.gemini_live_model,
+            voice=engine.gemini_default_voice,
+        )
+        link.arm_listen_only_until_caller()
+        return link
+    except Exception as exc:
+        logger.warning("LiveKit pool slot %s failed: %s", slot, type(exc).__name__)
+        try:
+            await link.close()
+        except Exception:
+            pass
+        return None
+
+
+async def _fill_livekit_pool() -> int:
+    from app.engine_config import current_engine_config, get_engine_config
+    from app.voice_pipeline.factory import get_pipeline_name
+    from app.voice_pipeline.realtime_link_factory import get_realtime_engine_name
+
+    if get_pipeline_name() != "gemini_live" or get_realtime_engine_name() != "livekit":
+        return _livekit_pool.qsize()
+    engine = current_engine_config() or await get_engine_config()
+    if not engine.gemini_api_key:
+        return _livekit_pool.qsize()
+    target = max(0, config.VOBIZ_LIVEKIT_POOL_SIZE)
+    if target == 0:
+        return 0
+    async with _pool_lock:
+        while _livekit_pool.qsize() < target:
+            link = await _create_pooled_livekit(_livekit_pool.qsize())
+            if link is None:
+                break
+            await _livekit_pool.put(link)
+    return _livekit_pool.qsize()
+
+
+async def borrow_livekit_session(expected_key: str = ""):
+    """Return an idle warmed LiveKit session (same portal key). Caller owns it; pool refills async."""
+    from app.engine_config import pooled_gemini_key
+
+    if expected_key and pooled_gemini_key() and pooled_gemini_key() != expected_key:
+        return None
+    try:
+        link = _livekit_pool.get_nowait()
+    except asyncio.QueueEmpty:
+        asyncio.create_task(_fill_livekit_pool())
+        return None
+    if link.ready and (not expected_key or getattr(link, "_api_key", "") == expected_key):
+        asyncio.create_task(_fill_livekit_pool())
+        return link
+    try:
+        await link.close()
+    except Exception:
+        pass
+    asyncio.create_task(_fill_livekit_pool())
+    return None
 
 
 async def _fill_gemini_pool() -> int:
@@ -388,7 +476,12 @@ async def _maintain_loop() -> None:
         await asyncio.sleep(interval)
         await _prime_supabase()
         if get_pipeline_name() == "gemini_live":
-            await _fill_gemini_pool()
+            from app.voice_pipeline.realtime_link_factory import get_realtime_engine_name
+
+            if get_realtime_engine_name() == "livekit":
+                await _fill_livekit_pool()
+            else:
+                await _fill_gemini_pool()
             asyncio.create_task(_warm_inbound_gemini_agents())
         else:
             await _fill_tts_pool()
@@ -433,12 +526,20 @@ async def warm_on_process_start() -> None:
             await lovable_client._get_client()
         except Exception:
             pass
-        gemini_slots = await _fill_gemini_pool()
+        from app.voice_pipeline.realtime_link_factory import get_realtime_engine_name
+
+        livekit_slots = 0
+        gemini_slots = 0
+        if get_realtime_engine_name() == "livekit":
+            livekit_slots = await _fill_livekit_pool()
+        else:
+            gemini_slots = await _fill_gemini_pool()
         asyncio.create_task(_warm_inbound_gemini_agents())
         logger.info(
-            "🔥 Gemini transport pool ready supabase=%s gemini_ws_slots=%s",
+            "🔥 Gemini transport pool ready supabase=%s gemini_ws_slots=%s livekit_pool_slots=%s",
             supabase_ok,
             gemini_slots,
+            livekit_slots,
         )
         start_background_warm_pool()
         return

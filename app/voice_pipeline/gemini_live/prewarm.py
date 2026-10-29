@@ -155,6 +155,7 @@ class PreparedGeminiSession:
 
     greeting_started: bool = False
     greeting_done: bool = False
+    greeting_context_injected: bool = False
     claimed: bool = False
     closed: bool = False
 
@@ -340,14 +341,9 @@ async def _warm_prepared_session(
             if empty_watch is None or empty_watch.done():
                 empty_watch = asyncio.create_task(_mark_empty_if_still_silent())
 
-        link = create_realtime_link(
-            f"prewarm_{entry.call_id[:12]}",
-            on_audio=_on_audio,
-            on_transcript=_on_transcript,
-            on_turn_complete=_on_turn_complete,
-        )
-        entry.link = link
         from app.engine_config import get_engine_config
+        from app.streaming import warm_pool
+        from app.voice_pipeline.realtime_link_factory import get_realtime_engine_name
 
         engine = await get_engine_config()
         entry.engine = engine
@@ -356,12 +352,38 @@ async def _warm_prepared_session(
             if entry.agent_config is not None
             else engine.gemini_default_voice
         )
-        await link.connect(
-            instructions,
-            api_key=engine.gemini_api_key,
-            model=engine.gemini_live_model,
-            voice=voice,
-        )
+        conn_id = f"prewarm_{entry.call_id[:12]}"
+        link = None
+        if get_realtime_engine_name() == "livekit":
+            link = await warm_pool.borrow_livekit_session(engine.gemini_api_key)
+            if link is not None:
+                link.rebind_handlers(
+                    on_audio=_on_audio,
+                    on_transcript=_on_transcript,
+                    on_turn_complete=_on_turn_complete,
+                )
+                link._connection_id = conn_id
+        if link is None:
+            link = create_realtime_link(
+                conn_id,
+                on_audio=_on_audio,
+                on_transcript=_on_transcript,
+                on_turn_complete=_on_turn_complete,
+            )
+            await link.connect(
+                instructions,
+                api_key=engine.gemini_api_key,
+                model=engine.gemini_live_model,
+                voice=voice,
+            )
+        else:
+            await link.reset_for_call(
+                instructions,
+                api_key=engine.gemini_api_key,
+                model=engine.gemini_live_model,
+                voice=voice,
+            )
+        entry.link = link
         entry.gemini_setup_ms = round((time.monotonic() - started) * 1000, 1)
         entry.ready_event.set()
 
@@ -369,7 +391,11 @@ async def _warm_prepared_session(
             return
 
         if cached_pcm:
+            arm = getattr(link, "arm_listen_only_until_caller", None)
+            if callable(arm):
+                arm()
             await link.inject_assistant_greeting_context(entry.welcome_text)
+            entry.greeting_context_injected = True
         elif entry.welcome_text.strip():
             entry.greeting_started = True
             await link.say(

@@ -134,6 +134,60 @@ class LiveKitGeminiLink:
             if self.ready or self._closed:
                 return
             await self._start_session(instructions)
+            try:
+                from app.streaming import warm_pool
+
+                asyncio.create_task(warm_pool._fill_livekit_pool())
+            except Exception:
+                pass
+
+    async def reset_for_call(
+        self,
+        instructions: str,
+        *,
+        api_key: str = "",
+        model: str = "",
+        voice: str = "",
+    ) -> None:
+        """Reuse a pooled transport for a new call (new RealtimeModel + instructions)."""
+        if api_key:
+            self._api_key = api_key
+        if model:
+            self._model_name = model
+        if voice:
+            self._voice = voice
+        default_voice = "Aoede"
+        try:
+            engine = await get_engine_config()
+            default_voice = engine.gemini_default_voice
+            if not self._api_key:
+                self._api_key = engine.gemini_api_key
+            if not self._model_name:
+                self._model_name = engine.gemini_live_model
+        except Exception:
+            pass
+        if not self._api_key:
+            self._api_key = config.GEMINI_API_KEY
+        if not self._model_name:
+            self._model_name = config.LIVEKIT_GEMINI_MODEL or config.GEMINI_LIVE_MODEL
+        self._voice = gemini_voice_or_default(self._voice, default_voice or "Aoede")
+        async with self._connect_lock:
+            if self._closed:
+                return
+            for task in list(self._consume_tasks):
+                task.cancel()
+            self._consume_tasks.clear()
+            if self._session is not None:
+                try:
+                    await self._session.aclose()
+                except Exception:
+                    pass
+                self._session = None
+            self._model = None
+            self._setup_ok = False
+            self._listen_only_until_user = False
+            self._setup_done.clear()
+            await self._start_session(instructions)
 
     async def _start_session(self, instructions: str) -> None:
         if not self._api_key:
@@ -196,6 +250,8 @@ class LiveKitGeminiLink:
         )
 
     def _on_input_speech_started(self, _ev) -> None:
+        # Unblock model output as soon as caller speech is detected (before transcript).
+        self._listen_only_until_user = False
         if self._on_interrupt is not None:
             asyncio.create_task(self._on_interrupt())
 
@@ -259,6 +315,8 @@ class LiveKitGeminiLink:
     async def send_pcm16k(self, pcm: bytes) -> None:
         if not pcm or self._closed or not self.ready:
             return
+        if self._listen_only_until_user:
+            self._listen_only_until_user = False
         rtc, _, _, _ = _livekit_imports()
         samples = len(pcm) // 2
         if samples <= 0:
@@ -278,6 +336,9 @@ class LiveKitGeminiLink:
     def arm_listen_only_until_caller(self) -> None:
         """Drop model audio/text until the caller's first transcribed turn."""
         self._listen_only_until_user = True
+
+    def release_listen_only(self) -> None:
+        self._listen_only_until_user = False
 
     async def on_caller_turn_started(self) -> None:
         """Clear stuck LiveKit generation state so the model can reply to the caller."""
