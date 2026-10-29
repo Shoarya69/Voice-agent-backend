@@ -27,7 +27,8 @@ from app.voice_pipeline.gemini_live.call_end import (
     assistant_sounds_like_closing,
     user_requested_hangup,
 )
-from app.voice_pipeline.gemini_live.link import GeminiLiveLink, connect_session
+from app.voice_pipeline.gemini_live.link import connect_session
+from app.voice_pipeline.realtime_link_factory import create_realtime_link
 
 logger = logging.getLogger(__name__)
 
@@ -57,7 +58,7 @@ class GeminiLivePipelineSession(VoicePipelineSession):
         self._call_error_stage = ""
         self._engine = None
         self._barge_in = GeminiBargeInController()
-        self._link = GeminiLiveLink(
+        self._link = create_realtime_link(
             connection_id,
             on_audio=self._on_model_audio,
             on_transcript=self._on_transcript,

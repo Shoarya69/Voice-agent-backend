@@ -26,6 +26,7 @@ from app.telephony.vobiz.gemini_session import VobizGeminiLiveSession
 from app.telephony.vobiz.stream import VobizStream
 from app.voice_pipeline.gemini_live import prewarm
 from app.voice_pipeline.gemini_live.link import gemini_speak_message
+from app.voice_pipeline.realtime_link_factory import get_realtime_engine_name
 from app.voice_pipeline.gemini_live.barge_in import (
     GeminiBargeInController,
     assistant_text_is_question,
@@ -320,7 +321,13 @@ class GeminiVoiceServerTests(unittest.IsolatedAsyncioTestCase):
                     "692d4bc7-c368-410c-82de-fd696e0fd1d5",
                 )
 
-    def test_11_native_audio_greeting_uses_realtime_text(self):
+    def test_11_realtime_engine_env_defaults_to_gemini(self):
+        with patch.object(config, "VOICE_REALTIME_ENGINE", "gemini"):
+            self.assertEqual(get_realtime_engine_name(), "gemini")
+        with patch.object(config, "VOICE_REALTIME_ENGINE", "livekit"):
+            self.assertEqual(get_realtime_engine_name(), "livekit")
+
+    def test_12_native_audio_greeting_uses_realtime_text(self):
         msg = gemini_speak_message("Speak ONLY this opening greeting: hello")
         self.assertEqual(
             msg["realtimeInput"]["text"],
@@ -328,7 +335,7 @@ class GeminiVoiceServerTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertNotIn("clientContent", msg)
 
-    async def test_12_empty_prewarm_greeting_is_spoken_on_the_live_call(self):
+    async def test_13_empty_prewarm_greeting_is_spoken_on_the_live_call(self):
         ws = MagicMock()
         vobiz = VobizStream(ws)
         vobiz.stream_id = "stream-empty"

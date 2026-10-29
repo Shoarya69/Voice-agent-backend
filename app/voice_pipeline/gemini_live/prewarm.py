@@ -28,7 +28,7 @@ from app.audio_utils import (
     scale_pcm_volume,
 )
 from app.supabase_agent_provider import normalize_language
-from app.voice_pipeline.gemini_live.link import GeminiLiveLink
+from app.voice_pipeline.realtime_link_factory import create_realtime_link
 from app.voice_pipeline.tools import gemini_live_system_instructions
 
 logger = logging.getLogger(__name__)
@@ -144,7 +144,7 @@ class PreparedGeminiSession:
     agent_config: lovable_client.AgentConfig | None = None
     engine: object | None = None
     welcome_text: str = ""
-    link: GeminiLiveLink | None = None
+    link: object | None = None
 
     # Pre-rendered greeting audio buffers (8 kHz PCM frames + 8 kHz μ-law bytes)
     ulaw_greeting: bytearray = field(default_factory=bytearray)
@@ -340,7 +340,7 @@ async def _warm_prepared_session(
             if empty_watch is None or empty_watch.done():
                 empty_watch = asyncio.create_task(_mark_empty_if_still_silent())
 
-        link = GeminiLiveLink(
+        link = create_realtime_link(
             f"prewarm_{entry.call_id[:12]}",
             on_audio=_on_audio,
             on_transcript=_on_transcript,

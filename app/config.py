@@ -125,6 +125,16 @@ HTTP_KEEPALIVE_EXPIRY = _get_float("HTTP_KEEPALIVE_EXPIRY", 30.0)
 # gemini_live      — Gemini Native Multimodal Live API (speech-to-speech)
 VOICE_PIPELINE = os.getenv("VOICE_PIPELINE", "compound").strip().lower()
 
+# Which Gemini realtime transport to use when VOICE_PIPELINE=gemini_live (Vobiz/Exotel):
+#   gemini   — direct Google Live WebSocket (app/voice_pipeline/gemini_live/link.py)
+#   livekit  — LiveKit Agents Google plugin (livekit.plugins.google.realtime)
+VOICE_REALTIME_ENGINE = os.getenv("VOICE_REALTIME_ENGINE", "gemini").strip().lower()
+
+# Optional LiveKit Cloud worker (separate from Vobiz μ-law path) — see livekit_worker.py
+LIVEKIT_URL = os.getenv("LIVEKIT_URL", "").strip()
+LIVEKIT_API_KEY = os.getenv("LIVEKIT_API_KEY", "").strip()
+LIVEKIT_API_SECRET = os.getenv("LIVEKIT_API_SECRET", "").strip()
+
 # Gemini Live (only when VOICE_PIPELINE=gemini_live)
 GEMINI_API_KEY = (os.getenv("GEMINI_API_KEY", "") or os.getenv("GOOGLE_API_KEY", "")).strip()
 def _gemini_token(env_name: str, default: str) -> str:
@@ -140,6 +150,8 @@ def _gemini_token(env_name: str, default: str) -> str:
 
 GEMINI_LIVE_MODEL = _gemini_token("GEMINI_LIVE_MODEL", "gemini-3.8-live")
 GEMINI_LIVE_VOICE = _gemini_token("GEMINI_LIVE_VOICE", "Kore")
+# Optional model override when VOICE_REALTIME_ENGINE=livekit (else portal bootstrap / GEMINI_LIVE_MODEL)
+LIVEKIT_GEMINI_MODEL = _gemini_token("LIVEKIT_GEMINI_MODEL", "")
 GEMINI_LIVE_WS_URL = os.getenv(
     "GEMINI_LIVE_WS_URL",
     "wss://generativelanguage.googleapis.com/ws/"

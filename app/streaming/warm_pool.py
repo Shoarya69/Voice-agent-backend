@@ -238,8 +238,9 @@ async def _drain_gemini_pool() -> None:
 async def refill_gemini_pool_for_new_key() -> None:
     """Drop idle sockets opened with a previous key. Live calls are not in this queue."""
     from app.voice_pipeline.factory import get_pipeline_name
+    from app.voice_pipeline.realtime_link_factory import get_realtime_engine_name
 
-    if get_pipeline_name() != "gemini_live":
+    if get_pipeline_name() != "gemini_live" or get_realtime_engine_name() != "gemini":
         return
     async with _pool_lock:
         await _drain_gemini_pool()
@@ -249,8 +250,9 @@ async def refill_gemini_pool_for_new_key() -> None:
 async def _fill_gemini_pool() -> int:
     from app.engine_config import current_engine_config, get_engine_config
     from app.voice_pipeline.factory import get_pipeline_name
+    from app.voice_pipeline.realtime_link_factory import get_realtime_engine_name
 
-    if get_pipeline_name() != "gemini_live":
+    if get_pipeline_name() != "gemini_live" or get_realtime_engine_name() != "gemini":
         return _gemini_ws_pool.qsize()
     engine = current_engine_config() or await get_engine_config()
     if not engine.gemini_api_key:
@@ -299,7 +301,7 @@ async def _warm_inbound_gemini_agents() -> None:
             cached_greeting_pcm,
             save_synthesized_greeting_pcm,
         )
-        from app.voice_pipeline.gemini_live.link import GeminiLiveLink
+        from app.voice_pipeline.realtime_link_factory import create_realtime_link
         from app.voice_pipeline.gemini_live.prewarm import (
             build_gemini_instructions_for_agent,
             build_welcome_text,
@@ -338,7 +340,7 @@ async def _warm_inbound_gemini_agents() -> None:
             async def _on_done() -> None:
                 done_ev.set()
 
-            link = GeminiLiveLink(
+            link = create_realtime_link(
                 "startup_greeting_warm",
                 on_audio=_on_audio,
                 on_turn_complete=_on_done,

@@ -858,8 +858,13 @@ async def main():
         from app.engine_config import current_engine_config
 
         engine = current_engine_config()
+        from app.voice_pipeline.realtime_link_factory import get_realtime_engine_name
+
+        rt_engine = get_realtime_engine_name()
         logger.info(
-            "🧠 Gemini Live: model '%s' voice '%s' key=%s (portal bootstrap, no ElevenLabs, no ChatGPT)",
+            "🧠 Gemini Live: realtime_engine=%s model '%s' voice '%s' key=%s "
+            "(portal bootstrap, no ElevenLabs, no ChatGPT)",
+            rt_engine,
             engine.gemini_live_model if engine else "pending",
             engine.gemini_default_voice if engine else "pending",
             engine.masked_key() if engine else "missing",
