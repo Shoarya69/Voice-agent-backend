@@ -334,9 +334,29 @@ async def handle_vobiz_websocket(websocket) -> None:
 
                 if not agent_preloaded:
                     voice_server._commit_agent_config_to_session(session)
+                if isinstance(session, VobizGeminiLiveSession) and session.agent_config:
+                    await session.warm_playback_pipeline()
                 call_records.schedule_call_started(session)
                 await session.on_agent_ready()
-                await session.speak_welcome()
+                try:
+                    await session.speak_welcome()
+                except Exception as exc:
+                    from app.engine_config import GeminiAuthError, GeminiVoiceError
+
+                    stage = getattr(session, "_call_error_stage", "") or "gemini_session"
+                    if isinstance(exc, (GeminiAuthError, GeminiVoiceError)):
+                        stage = (
+                            "gemini_voice"
+                            if isinstance(exc, GeminiVoiceError)
+                            else "gemini_auth"
+                        )
+                    await voice_server._speak_gemini_session_failure_and_close(
+                        session,
+                        connection_id,
+                        stage=stage,
+                    )
+                    end_reason = stage
+                    break
                 agent_started = True
 
             elif event_type == "media":

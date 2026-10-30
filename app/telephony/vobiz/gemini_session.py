@@ -164,6 +164,8 @@ class VobizGeminiLiveSession(VobizCompoundSession):
         self._greeting_context_injected = False
         self._opening_greeting_aborted = False
         self._opening_dead_air_logged = False
+        self._link_configured_agent_id = ""
+        self._pending_inbound_pcm16k: list[bytes] = []
         self._barge_in = GeminiBargeInController()
         self._link = create_realtime_link(
             connection_id,
@@ -228,6 +230,21 @@ class VobizGeminiLiveSession(VobizCompoundSession):
         if len(norm_chunk) <= len(norm_open) and norm_open.startswith(norm_chunk):
             return True
         if len(norm_open) <= len(norm_chunk) and norm_chunk.startswith(norm_open):
+            return True
+        return False
+
+    def _is_generic_env_welcome(self, text: str) -> bool:
+        """Drop .env WELCOME_MESSAGE when the call already has a portal first_message."""
+        if self._user_turns > 1:
+            return False
+        agent = getattr(self, "agent_config", None)
+        if not agent or not (agent.first_message or "").strip():
+            return False
+        chunk = (text or "").strip().lower()
+        env = (config.WELCOME_MESSAGE or "").strip().lower()
+        if not chunk or not env:
+            return False
+        if chunk == env or env.startswith(chunk) or chunk in env:
             return True
         return False
 
@@ -303,6 +320,7 @@ class VobizGeminiLiveSession(VobizCompoundSession):
                     self._link.inject_assistant_greeting_context(entry.welcome_text)
                 )
 
+        self._link_configured_agent_id = entry.agent_config.agent_id or ""
         asyncio.create_task(old_link.close())
         return True
 
@@ -482,8 +500,16 @@ class VobizGeminiLiveSession(VobizCompoundSession):
         if not self.greeting_audio_pcm and not self._greeting_started:
             await self._ensure_link()
 
+    async def _flush_pending_inbound_pcm(self) -> None:
+        if not self._link.ready or not self._pending_inbound_pcm16k:
+            return
+        pending = self._pending_inbound_pcm16k
+        self._pending_inbound_pcm16k = []
+        for chunk in pending:
+            await self._link.send_pcm16k(chunk)
+
     async def add_audio_chunk(self, media_data: dict) -> None:
-        if self._closed or not self._link.ready:
+        if self._closed:
             return
         ulaw = decode_payload(media_data.get("payload", ""))
         if not ulaw:
@@ -563,6 +589,12 @@ class VobizGeminiLiveSession(VobizCompoundSession):
             return
 
         self._drop_model_audio_until_next_turn = False
+        if not self._link.ready:
+            self._pending_inbound_pcm16k.append(pcm_16k)
+            if len(self._pending_inbound_pcm16k) > 75:
+                self._pending_inbound_pcm16k.pop(0)
+            return
+        await self._flush_pending_inbound_pcm()
         await self._link.send_pcm16k(pcm_16k)
 
     async def _start_greeting_if_needed(self) -> None:
@@ -610,6 +642,8 @@ class VobizGeminiLiveSession(VobizCompoundSession):
             if self._prewarm_greeting_done:
                 self._barge_in.on_assistant_speaking_start()
             await self._drain_ulaw(force=False)
+            if self._ulaw_out_buffer:
+                await self._drain_ulaw(force=True)
             self._record_first_audio_out()
             if self._prewarm_greeting_done:
                 self._greeting_playback_task = asyncio.create_task(
@@ -645,6 +679,8 @@ class VobizGeminiLiveSession(VobizCompoundSession):
             await self._start_greeting_if_needed()
             if self._ulaw_out_buffer and self._vobiz.stream_id:
                 await self._drain_ulaw(force=False)
+                if self._ulaw_out_buffer:
+                    await self._drain_ulaw(force=True)
                 self._record_first_audio_out()
                 if self._prewarm_greeting_done:
                     self._greeting_playback_task = asyncio.create_task(
@@ -656,6 +692,10 @@ class VobizGeminiLiveSession(VobizCompoundSession):
                 self.connection_id,
                 exc,
             )
+            from app.engine_config import GeminiAuthError, GeminiVoiceError
+
+            if isinstance(exc, (GeminiAuthError, GeminiVoiceError)):
+                raise
 
     async def handle_clear(self) -> None:
         await self._on_interrupt()
@@ -670,15 +710,29 @@ class VobizGeminiLiveSession(VobizCompoundSession):
         await super().close()
 
     async def _ensure_link(self) -> None:
-        if self._link.ready:
+        agent = getattr(self, "agent_config", None)
+        agent_id = (getattr(agent, "agent_id", "") or "") if agent else ""
+        if (
+            self._link.ready
+            and agent_id
+            and self._link_configured_agent_id == agent_id
+        ):
+            await self._flush_pending_inbound_pcm()
+            return
+        if self._link.ready and not agent_id:
+            await self._flush_pending_inbound_pcm()
             return
         try:
             await connect_session(self._link, self)
+            await self._flush_pending_inbound_pcm()
         except Exception as exc:
-            from app.engine_config import GeminiAuthError
+            from app.engine_config import GeminiAuthError, GeminiVoiceError
 
             if isinstance(exc, GeminiAuthError):
                 self._call_error_stage = "gemini_auth"
+            elif isinstance(exc, GeminiVoiceError):
+                self._call_error_stage = "gemini_voice"
+            if isinstance(exc, GeminiAuthError):
                 try:
                     await self.websocket.close(code=1000, reason="gemini auth failed")
                 except Exception:
@@ -798,6 +852,13 @@ class VobizGeminiLiveSession(VobizCompoundSession):
         if role == "assistant" and self._is_opening_script_repeat(text):
             logger.debug(
                 "Dropping duplicate opening assistant partial conn=%s text=%s",
+                self.connection_id,
+                (text or "")[:80],
+            )
+            return
+        if role == "assistant" and self._is_generic_env_welcome(text):
+            logger.debug(
+                "Dropping generic env welcome on agent call conn=%s text=%s",
                 self.connection_id,
                 (text or "")[:80],
             )

@@ -307,6 +307,48 @@ async def _await_agent_prefetch(session: VoicePipelineSession, connection_id: st
     return resolved
 
 
+_GEMINI_FAILURE_SPOKEN_LINE = (
+    "Maaf kijiye, abhi call connect nahi ho pa rahi. "
+    "Kripya thodi der baad dubara koshish karein."
+)
+
+
+async def _speak_gemini_session_failure_and_close(
+    session: VoicePipelineSession,
+    connection_id: str,
+    *,
+    stage: str,
+) -> None:
+    """Log Gemini/LiveKit failure, play a short line, and finalize call-log."""
+    session._call_error_stage = stage
+    logger.error(
+        "Gemini Live session failed conn=%s stage=%s route=%s agent_id=%s",
+        connection_id,
+        stage,
+        getattr(session, "wss_route_kind", ""),
+        getattr(session, "agent_id", ""),
+    )
+    from app.telephony.vobiz.gemini_session import VobizGeminiLiveSession
+
+    if isinstance(session, VobizGeminiLiveSession) and session._vobiz.stream_id:
+        try:
+            if session._link.ready:
+                await session._link.say(_GEMINI_FAILURE_SPOKEN_LINE)
+                await asyncio.sleep(2.5)
+                await session.flush_playback_output()
+        except Exception as exc:
+            logger.warning(
+                "Could not play Gemini failure line conn=%s: %s",
+                connection_id,
+                exc,
+            )
+    call_records.schedule_finalize_call(session)
+    try:
+        await session.close()
+    except Exception:
+        pass
+
+
 async def _speak_fallback_and_close(session: VoicePipelineSession, connection_id: str):
     """Speak the .env WELCOME_MESSAGE (no agent overrides applied) then close."""
     try:

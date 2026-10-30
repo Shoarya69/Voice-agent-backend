@@ -404,6 +404,22 @@ class GeminiVoiceServerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(session.history, [])
         self.assertTrue(session._is_opening_script_repeat("Namaste. Kya aap"))
 
+    async def test_17_drop_generic_env_welcome_when_agent_has_first_message(self):
+        ws = MagicMock()
+        vobiz = VobizStream(ws)
+        session = VobizGeminiLiveSession("vobiz_generic", ws, vobiz)
+        session.agent_config = lovable_client.AgentConfig(
+            agent_id="agent-1",
+            token="t" * 20,
+            first_message="hello sir me karan baat kara hu",
+            system_prompt="You are Karan from Moontech.",
+        )
+        session._user_turns = 0
+        session.history = []
+        with patch.object(config, "WELCOME_MESSAGE", "Hi! I'm your AI assistant."):
+            await session._on_transcript("assistant", "Hi! I'm your AI assistant.")
+        self.assertEqual(session.history, [])
+
 
 if __name__ == "__main__":
     unittest.main()

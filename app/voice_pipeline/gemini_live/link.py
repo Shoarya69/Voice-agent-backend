@@ -581,15 +581,28 @@ async def connect_session(link: GeminiLiveLink, session) -> None:
         engine = await get_engine_config()
         session._engine = engine
     agent = getattr(session, "agent_config", None)
-    if agent is not None and (getattr(agent, "system_prompt", "") or "").strip():
+    conn_id = getattr(session, "connection_id", "")
+    if agent is not None:
         from app.voice_pipeline.gemini_live.prewarm import build_gemini_instructions_for_agent
 
         instructions = build_gemini_instructions_for_agent(agent)
         voice = agent.gemini_voice_name(engine.gemini_default_voice)
+        if not (getattr(agent, "system_prompt", "") or "").strip():
+            logger.warning(
+                "Gemini connect using agent bundle with empty system_prompt "
+                "conn=%s agent_id=%s (portal defaults applied)",
+                conn_id,
+                getattr(agent, "agent_id", ""),
+            )
     else:
         from app.openai_service import openai_brain
         from app.voice_pipeline.tools import gemini_live_system_instructions
 
+        logger.error(
+            "Gemini connect without agent_config conn=%s — generic instructions "
+            "(outbound/token calls must resolve agent bundle before connect)",
+            conn_id,
+        )
         base = openai_brain._messages([])[0]["content"]
         instructions = gemini_live_system_instructions(base)
         voice = engine.gemini_default_voice
@@ -603,12 +616,36 @@ async def connect_session(link: GeminiLiveLink, session) -> None:
             "Stay silent and listen. Answer their next question directly.]"
         )
     try:
-        await link.connect(
-            instructions,
-            api_key=engine.gemini_api_key,
-            model=engine.gemini_live_model,
-            voice=voice,
-        )
+        reset = getattr(link, "reset_for_call", None)
+        if link.ready and callable(reset):
+            await reset(
+                instructions,
+                api_key=engine.gemini_api_key,
+                model=engine.gemini_live_model,
+                voice=voice,
+            )
+        elif link.ready:
+            configured = getattr(session, "_link_configured_agent_id", None)
+            agent_id = getattr(agent, "agent_id", None) if agent else None
+            if agent_id and configured == agent_id:
+                pass
+            elif configured and agent_id and configured != agent_id:
+                await link.close()
+                await link.connect(
+                    instructions,
+                    api_key=engine.gemini_api_key,
+                    model=engine.gemini_live_model,
+                    voice=voice,
+                )
+        else:
+            await link.connect(
+                instructions,
+                api_key=engine.gemini_api_key,
+                model=engine.gemini_live_model,
+                voice=voice,
+            )
+        if agent is not None:
+            session._link_configured_agent_id = getattr(agent, "agent_id", "") or ""
     except GeminiAuthError:
         session._call_error_stage = "gemini_auth"
         logger.error(
